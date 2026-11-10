@@ -1,0 +1,67 @@
+---
+title: Continuum
+description: Seamless, Apple Continuity-grade integration for Linux + Android.
+template: splash
+hero:
+  tagline: Seamless, Apple Continuity-grade integration for the Linux + Android ecosystem. Local-first, zero cloud dependencies, and privacy by design.
+  actions:
+    - text: Explore Features
+      link: /overview/vision/
+      icon: right-arrow
+      variant: primary
+    - text: Feature Matrix
+      link: /overview/feature-matrix/
+      icon: open-book
+    - text: View on GitHub
+      link: https://github.com/sortedcord/continuum
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## What Continuum Delivers
+
+<CardGrid stagger>
+  <Card title="Ambient Proximity & Presence" icon="signal">
+    Devices automatically recognize when they are near each other using ultra-low-power BLE beacons and local Wi-Fi presence.
+  </Card>
+  <Card title="High-Speed File Transfer" icon="document">
+    Zero-configuration peer-to-peer AirDrop equivalent for multi-gigabyte transfers over local Wi-Fi and Wi-Fi Direct.
+  </Card>
+  <Card title="Universal Clipboard" icon="pencil">
+    Instantaneous bidirectional copy and paste for text, formatting, and images, protected with password-manager exclusions.
+  </Card>
+  <Card title="Continuity Camera & Mic" icon="video">
+    Use your Android phone's advanced camera array as an HD wireless webcam and studio microphone in desktop apps.
+  </Card>
+  <Card title="Screen Mirroring & Sidecar" icon="laptop">
+    Low-latency interactive phone display mirroring and virtual multi-monitor extension with active stylus digitizer support.
+  </Card>
+  <Card title="Handsfree Calls & Notifications" icon="phone">
+    Answer phone calls handsfree through your laptop's mic and speakers, with two-way notification sync and inline quick-reply.
+  </Card>
+  <Card title="Biometric Sudo Approval" icon="approve-check-circle">
+    Approve terminal `sudo` commands and desktop admin prompts using your phone's fingerprint sensor via `pam_continuum`.
+  </Card>
+  <Card title="Beyond Apple Superpowers" icon="rocket">
+    N-device mesh networking, full UNIX CLI pipeline support, multi-window app streaming, and zero cloud accounts.
+  </Card>
+</CardGrid>
+
+---
+
+## Dive Deeper
+
+<CardGrid>
+  <LinkCard
+    title="Continuum Superpowers"
+    description="Discover how Continuum goes beyond proprietary walled gardens with open platform capabilities."
+    href="/overview/superpowers/"
+  />
+  <LinkCard
+    title="Project Roadmap"
+    description="Explore the phased checkpoint roadmap, starting from Checkpoint 1 (The Core Discovery Engine)."
+    href="/overview/roadmap/"
+  />
+</CardGrid>
