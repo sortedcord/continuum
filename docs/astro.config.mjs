@@ -56,6 +56,7 @@ export default defineConfig({
 						{ label: 'Phone Screen Mirroring', slug: 'workspace/screen-mirroring' },
 						{ label: 'Sidecar (Virtual Display & Tablet)', slug: 'workspace/sidecar' },
 						{ label: 'Universal Control', slug: 'workspace/universal-control' },
+						{ label: 'Virtual Trackpad, Keyboard & Gamepad', slug: 'workspace/remote-input' },
 						{ label: 'Continuity Sketch & Markup', slug: 'workspace/sketch-markup' },
 					],
 				},

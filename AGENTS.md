@@ -163,6 +163,11 @@ Every Continuity feature relies on answering three fundamental questions without
 - **Universal Control Equivalent (Cross-Device Mouse & Keyboard)**:
   - Seamlessly push the Linux mouse cursor off the edge of the monitor onto the Android screen.
   - Share single mouse and keyboard focus across physical devices without screen mirroring.
+- **Virtual Input Device (Phone as Trackpad, Keyboard & Gamepad)**:
+  - **Multi-Touch Precision Trackpad**: Turn the phone screen into a responsive laptop trackpad with multi-touch gestures (1-finger point/click, 2-finger scroll, 3-finger workspace swipe, pinch-to-zoom) with haptic feedback.
+  - **Virtual Keyboard & Voice Typing**: Send keystrokes directly to Linux using your phone's touch keyboard, mobile speech-to-text dictation, customizable macro pads, function keys, and numpads.
+  - **Virtual Gamepad & Gyro Controller**: Turn the phone into a custom wireless gamepad (analog thumbsticks, D-pad, ABXY face buttons, shoulder triggers) with motion/gyro steering for Linux games and emulators.
+  - **Gyro Air Mouse & Presentation Clicker**: Point and wave your phone in the air to control the desktop cursor or advance slides during presentations using the phone's gyroscope.
 
 #### Checkpoint 6: Deep Ecosystem, Productivity & Security Integration
 - **PAM / Sudo Biometric Approval (`pam_continuum`)**:

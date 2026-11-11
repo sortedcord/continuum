@@ -47,6 +47,7 @@ Continuum maps every major Apple Continuity feature to an open equivalent—and 
 | **iPhone Mirroring** | **Screen Mirroring** | Low-latency interactive phone display window on Linux with keyboard/mouse control. | **Multi-window app streaming**: run individual Android apps as separate floating desktop windows. |
 | **Sidecar** | **Virtual Display & Tablet** | Use phone/tablet as a virtual second monitor with stylus digitizer support. | Unlimited virtual screens, custom resolutions/aspect ratios, pressure & tilt support. |
 | **Universal Control** | **Cross-Device Cursor** | Push your desktop mouse pointer off the monitor edge directly into Android. | Custom spatial grid layout, multi-machine flow (1 laptop + multiple tablets/phones). |
+| *(No Native Apple Equivalent)* | **Virtual Trackpad & Gamepad** | Use phone screen as a multi-touch trackpad, remote keyboard/numpad, presentation air-mouse, or wireless gamepad. | Multi-player virtual gamepads (connect 4 phones for split-screen gaming), custom macro pads (Stream Deck alternative), gyro steering. |
 | **Continuity Sketch** | **Quick Sketch & Markup** | Draw diagrams, sign PDFs, and annotate documents on mobile with live desktop sync. | Resolution-independent vector SVG exports, direct integration with GIMP/Krita. |
 | **Cellular Calls** | **Cellular Call Relay** | Incoming call pop-ups on laptop; answer and talk handsfree via laptop mic/speakers. | In-call controls, DTMF keypad, local call recording with consent. |
 | **Shared Notifications** | **Two-Way Notification Hub** | Mirrored notifications with inline quick-reply and remote action buttons. | Full two-way dismissal sync, per-app filtering, regex mute rules. |
@@ -95,6 +96,7 @@ The project progresses through six modular checkpoints:
   * Low-latency phone screen mirroring with remote input and audio forwarding.
   * Sidecar virtual second monitor and stylus graphics tablet mode.
   * Universal Control cross-device mouse and keyboard sharing.
+  * Virtual multi-touch trackpad, remote keyboard/numpad, air mouse, and wireless gamepad.
 * **Checkpoint 6: Deep Ecosystem, Productivity & Security Integration**
   * Cellular call relay and full-duplex handsfree calling.
   * Shared notifications with inline reply and two-way dismissal sync.
