@@ -1,9 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::net::SocketAddr;
 
 use continuum_core::clock::{Clock, SystemClock, Timestamp};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpStream;
 
 pub fn now() -> Timestamp {
     SystemClock.now()
@@ -30,37 +28,6 @@ pub fn local_addrs(port: u16) -> Vec<SocketAddr> {
         .collect();
     addrs.sort_by_key(|addr| u8::from(!addr.is_ipv4()));
     addrs
-}
-
-/// Orders candidate peer addresses: private IPv4 first, then IPv6, and
-/// container bridges last.
-pub fn rank_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
-    let mut addrs: Vec<_> = addrs
-        .into_iter()
-        .filter(|a| !a.ip().is_loopback())
-        .collect();
-    addrs.sort_by_key(|addr| match addr.ip() {
-        IpAddr::V4(v4) if v4.octets()[0] == 172 && v4.octets()[1] == 17 => 3,
-        IpAddr::V4(_) => 0,
-        IpAddr::V6(v6) if v6.is_unicast_link_local() => 2,
-        IpAddr::V6(_) => 1,
-    });
-    addrs
-}
-
-/// Connects to the first address that answers.
-pub async fn connect_any(addrs: &[SocketAddr]) -> anyhow::Result<TcpStream> {
-    for addr in addrs {
-        match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                stream.set_nodelay(true).ok();
-                return Ok(stream);
-            }
-            Ok(Err(err)) => tracing::debug!(%addr, %err, "connect failed"),
-            Err(_) => tracing::debug!(%addr, "connect timed out"),
-        }
-    }
-    anyhow::bail!("none of {} address(es) answered", addrs.len())
 }
 
 /// Asks a yes/no question on the terminal.

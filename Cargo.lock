@@ -399,6 +399,7 @@ dependencies = [
  "continuum-core",
  "continuum-linux",
  "continuum-net",
+ "continuum-node",
  "continuum-quickshare",
  "if-addrs",
  "qrcode",
@@ -413,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "bluer",
  "continuum-core",
+ "continuum-node",
  "continuum-quickshare",
  "futures",
  "oo7",
@@ -429,6 +431,17 @@ version = "0.1.0"
 dependencies = [
  "continuum-core",
  "prost",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "continuum-node"
+version = "0.1.0"
+dependencies = [
+ "continuum-core",
+ "continuum-net",
  "thiserror",
  "tokio",
  "tracing",

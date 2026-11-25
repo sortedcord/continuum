@@ -15,6 +15,7 @@ continuum-core = { path = "crates/continuum-core" }
 continuum-quickshare = { path = "crates/continuum-quickshare" }
 continuum-net = { path = "crates/continuum-net" }
 continuum-linux = { path = "crates/continuum-linux" }
+continuum-node = { path = "crates/continuum-node" }
 
 base64 = "0.23"
 ed25519-dalek = "3"

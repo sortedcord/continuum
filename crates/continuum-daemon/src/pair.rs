@@ -15,12 +15,13 @@ use continuum_core::session::Sas;
 use continuum_core::trust::TrustedPeer;
 use continuum_linux::avahi::{Avahi, BrowseEvent};
 use continuum_linux::ble::Ble;
-use continuum_linux::discovery::{continuum_observation, continuum_spec};
-use continuum_net::{Intent, PairingMethod, pair_initiator, pair_responder, read_preamble};
+use continuum_net::{Intent, PairingMethod, pair_responder, read_preamble};
+use continuum_node::pairing::{join_invite, join_with_code};
+use continuum_node::records::{continuum_record, lan_observation};
 use tokio::net::TcpListener;
 
 use crate::ctx::{Ctx, short_id};
-use crate::util::{confirm, connect_any, local_addrs, now, print_qr};
+use crate::util::{confirm, local_addrs, now, print_qr};
 
 async fn confirm_sas(sas: Sas, peer: TrustedPeer) -> bool {
     println!();
@@ -68,7 +69,7 @@ pub async fn invite(ctx: &mut Ctx, ttl: Duration, allow_sas: bool) -> anyhow::Re
     let id = random_id(&mut OsEntropy);
     let avahi = Avahi::connect().await?;
     let _mdns = avahi
-        .publish(&continuum_spec(
+        .publish(&continuum_record(
             id,
             port,
             BeaconFlags::PAIRING.with(BeaconFlags::LAN),
@@ -133,29 +134,17 @@ pub async fn invite(ctx: &mut Ctx, ttl: Duration, allow_sas: bool) -> anyhow::Re
 /// Joins an invite shown by another device.
 pub async fn join(ctx: &mut Ctx, text: &str) -> anyhow::Result<()> {
     let invite = Invite::decode(text).context("reading invite")?;
-    anyhow::ensure!(!invite.is_expired(now()), "this invite has expired");
     println!("Pairing with \"{}\" ...", invite.name);
-    let stream = connect_any(&invite.addrs).await?;
-    let peer = pair_initiator(
-        stream,
-        &ctx.identity,
-        ctx.device.clone(),
-        PairingMethod::Secret(&invite.secret),
-        confirm_sas,
-        &SystemClock,
-    )
-    .await?;
+    let peer = join_invite(&ctx.identity, ctx.device.clone(), text, &SystemClock).await?;
     saved(ctx, peer).await
 }
 
-/// Pairs by code comparison with a device at `addr`.
+/// Pairs by code comparison with a device at `addrs`.
 pub async fn join_sas(ctx: &mut Ctx, addrs: &[SocketAddr]) -> anyhow::Result<()> {
-    let stream = connect_any(addrs).await?;
-    let peer = pair_initiator(
-        stream,
+    let peer = join_with_code(
         &ctx.identity,
         ctx.device.clone(),
-        PairingMethod::Sas,
+        addrs,
         confirm_sas,
         &SystemClock,
     )
@@ -174,7 +163,7 @@ pub async fn scan(duration: Duration) -> anyhow::Result<Vec<Vec<SocketAddr>>> {
         tokio::select! {
             Some(event) = browser.next() => {
                 if let BrowseEvent::Resolved(service) = event
-                    && let Some(obs) = continuum_observation(&service, now())
+                    && let Some(obs) = lan_observation(&service.name, &service.txt, service.addr, now())
                     && obs.pairing
                     && let Some(addr) = obs.addr
                 {
@@ -184,5 +173,8 @@ pub async fn scan(duration: Duration) -> anyhow::Result<Vec<Vec<SocketAddr>>> {
             () = &mut deadline => break,
         }
     }
-    Ok(found.into_values().map(crate::util::rank_addrs).collect())
+    Ok(found
+        .into_values()
+        .map(continuum_node::rank_addrs)
+        .collect())
 }

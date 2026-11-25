@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 bluer = { version = "0.17", features = ["bluetoothd"] }
 continuum-core.workspace = true
+continuum-node.workspace = true
 continuum-quickshare.workspace = true
 futures = "0.3"
 oo7 = { version = "0.7", default-features = false, features = ["tokio", "native_crypto"] }

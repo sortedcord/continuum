@@ -131,22 +131,14 @@ fn avahi_type(service_type: &str) -> &str {
         .trim_end_matches(".local")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceSpec {
-    pub name: String,
-    /// e.g. `_continuum._tcp.local.`
-    pub service_type: String,
-    pub port: u16,
-    pub txt: Vec<(String, String)>,
-}
+/// What to publish. Shared with the portable node.
+pub use continuum_node::records::ServiceRecord as ServiceSpec;
 
-impl ServiceSpec {
-    fn txt_records(&self) -> Vec<Vec<u8>> {
-        self.txt
-            .iter()
-            .map(|(key, value)| format!("{key}={value}").into_bytes())
-            .collect()
-    }
+fn txt_records(spec: &ServiceSpec) -> Vec<Vec<u8>> {
+    spec.txt
+        .iter()
+        .map(|(key, value)| format!("{key}={value}").into_bytes())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,7 +338,7 @@ impl Publication {
                 "",
                 "",
                 spec.port,
-                spec.txt_records(),
+                txt_records(spec),
             )
             .await?;
         self.group.commit().await?;
