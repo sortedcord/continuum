@@ -8,12 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 continuum-proto.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 hmac.workspace = true
+prost.workspace = true
 sha2.workspace = true
+snow.workspace = true
 thiserror.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true

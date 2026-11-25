@@ -1,0 +1,38 @@
+// Continuum pairing protocol, version 1.
+syntax = "proto3";
+
+package continuum.v1;
+
+import "continuum/v1/session.proto";
+
+// Contents of the pairing QR code, shown by the device that is waiting to
+// be paired. Carries a one-time secret, so it must only travel out of band
+// (camera, or typed by hand).
+message PairingInvite {
+  uint32 version = 1;
+  // "ip:port" endpoints where the inviter accepts the pairing connection.
+  repeated string addrs = 2;
+  // 32-byte one-time pre-shared key for Noise XXpsk3.
+  bytes secret = 3;
+  // Inviter's display name, shown before connecting.
+  string name = 4;
+  // The inviter rejects the secret after this time.
+  uint64 expires_at_ms = 5;
+}
+
+// Sent by each side over the encrypted pairing channel.
+message PairingRecord {
+  bytes signing_key = 1;    // Ed25519 public key (the identity)
+  bytes agreement_key = 2;  // X25519 public key; must equal the Noise static key
+  bytes presence_key = 3;   // 32 bytes, resolves this device's rotating ids
+  DeviceInfo device = 4;
+  // Ed25519 signature over
+  // "continuum/pair/v1" || handshake_hash || agreement_key || presence_key,
+  // proving the identity key holder took part in this exact handshake.
+  bytes signature = 5;
+}
+
+// Final message: whether the user confirmed (SAS flow) and the peer was saved.
+message PairingResult {
+  bool accepted = 1;
+}

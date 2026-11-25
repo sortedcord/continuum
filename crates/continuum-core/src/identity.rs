@@ -164,6 +164,11 @@ impl DeviceIdentity {
         self.signing.sign(message)
     }
 
+    /// Raw X25519 private key, for the Noise handshake.
+    pub(crate) fn agreement_secret(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.agreement.to_bytes())
+    }
+
     /// Static-static Diffie-Hellman with a peer. Session handshakes build on
     /// this; it is not meant to be used as a key directly.
     pub fn agree(&self, peer: &AgreementPublicKey) -> Zeroizing<[u8; 32]> {

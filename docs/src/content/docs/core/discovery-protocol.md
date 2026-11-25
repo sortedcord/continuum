@@ -3,7 +3,7 @@ title: Discovery Protocol (Spec)
 description: How Continuum devices find each other without leaking who they are.
 ---
 
-Status: **draft, Checkpoint 1.** Reference implementation in `crates/continuum-core` and `crates/continuum-proto`.
+Status: **draft, Checkpoint 1.** Reference implementation in `crates/continuum-core` (sans-I/O logic), `crates/continuum-proto` (wire formats), `crates/continuum-net` (async transport) and `crates/continuum-linux` (Avahi, BlueZ, Secret Service).
 
 ## Principles
 
@@ -68,7 +68,37 @@ beacon = version(4 bits) | flags(4 bits) | id(12)
 
 ## Pairing mode
 
-Only while the user has a pairing dialog open, a device advertises a **random, unresolvable** ID with the pairing flag set. Receivers surface these as pairing candidates. The pairing exchange (QR / SAS, Checkpoint 1 M2) transfers public identities and presence keys.
+Only while the user has a pairing dialog open, a device advertises a **random, unresolvable** ID with the pairing flag set (BLE and mDNS). Receivers surface these as pairing candidates.
+
+## Connections
+
+Every TCP connection starts with a 6-byte preamble, `"CNTM" | version(1) | intent(1)`, followed by frames of `u16 big-endian length | bytes`. Handshake messages and encrypted transport messages are one frame each (at most 65 535 bytes).
+
+| Intent | Noise pattern | Authenticated by |
+| --- | --- | --- |
+| `1` session | `Noise_IK_25519_ChaChaPoly_BLAKE2s` | Static keys from the trust store |
+| `2` pair with QR secret | `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` | 32-byte one-time secret from the QR code |
+| `3` pair by code | `Noise_XX_25519_ChaChaPoly_BLAKE2s` | Users compare a 6-digit SAS |
+
+The prologue is `continuum/v1`. The Noise static key is the device's X25519 agreement key.
+
+### Pairing
+
+1. The device being paired shows an invite: `continuum:pair:` + base64url(`PairingInvite` protobuf) carrying its LAN addresses, a one-time 32-byte secret, its name and an expiry (5 minutes by default). About 125 characters, so the QR code stays small.
+2. The joiner connects and runs `XXpsk3` with the secret. A wrong secret fails the handshake.
+3. Each side sends a `PairingRecord`: Ed25519 key, X25519 key, presence key, device info, and an Ed25519 signature over `"continuum/pair/v1" || handshake_hash || agreement_key || presence_key`. The receiver checks that the agreement key equals the Noise remote static key and verifies the signature. Signing the handshake hash binds the record to this exact handshake, so it can't be replayed elsewhere.
+4. In the code flow, both users must confirm the SAS: `SHA-256("continuum/sas/v1" || handshake_hash)`, first 8 bytes as a big-endian integer, mod 1 000 000.
+5. Both sides send `PairingResult`. The peer is stored only if both accepted.
+
+### Sessions
+
+The initiator already knows the responder's static key from the trust store (`IK`, one round trip). The responder looks up the initiator's static key after the first message and drops unknown initiators **before replying**, so strangers learn nothing. Both sides then exchange `Hello` (device info plus capability manifest) inside an `Envelope`.
+
+The session sends a `Ping` every 10 s and closes after 3 silent intervals. If both devices connect at once, both keep the session initiated by the lower `DeviceId`. The higher-id device waits 10 s before connecting itself.
+
+## Storage
+
+On Linux, the identity secrets (96 bytes) and the trust store (`StoredTrust` protobuf, which includes peer presence keys) are two Secret Service items, with attributes `application=continuum`, `kind=identity|trust` and `profile=<name>`.
 
 ## Presence registry
 

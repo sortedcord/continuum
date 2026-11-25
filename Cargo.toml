@@ -5,13 +5,16 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/sortedcord/continuum"
 
 [workspace.dependencies]
 continuum-proto = { path = "crates/continuum-proto" }
 continuum-core = { path = "crates/continuum-core" }
+continuum-quickshare = { path = "crates/continuum-quickshare" }
+continuum-net = { path = "crates/continuum-net" }
+continuum-linux = { path = "crates/continuum-linux" }
 
 base64 = "0.23"
 ed25519-dalek = "3"
@@ -21,7 +24,10 @@ hmac = "0.13"
 prost = "0.14"
 prost-build = "0.14"
 sha2 = "0.11"
+snow = "0.10"
 thiserror = "2"
+tokio = { version = "1.54", features = ["io-util", "net", "rt", "macros", "time", "sync"] }
+tracing = "0.1"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 zeroize = { version = "1.9", features = ["derive"] }
 

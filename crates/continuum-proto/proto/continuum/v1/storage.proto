@@ -1,0 +1,18 @@
+// Local persistence formats. Never sent over the network; stored in the
+// platform keystore because they contain secrets (presence keys).
+syntax = "proto3";
+
+package continuum.v1;
+
+message StoredPeer {
+  bytes signing_key = 1;
+  bytes agreement_key = 2;
+  bytes presence_key = 3;
+  string name = 4;
+  uint64 paired_at_ms = 5;
+}
+
+message StoredTrust {
+  uint32 version = 1;
+  repeated StoredPeer peers = 2;
+}

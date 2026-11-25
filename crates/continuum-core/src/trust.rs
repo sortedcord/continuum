@@ -4,9 +4,72 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
+use continuum_proto::v1::{StoredPeer, StoredTrust};
+use ed25519_dalek::VerifyingKey;
+use prost::Message;
+use x25519_dalek::PublicKey as AgreementPublicKey;
+use zeroize::Zeroizing;
+
 use crate::clock::Timestamp;
 use crate::identity::{DeviceId, PublicIdentity};
 use crate::rid::PresenceKey;
+
+const STORAGE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StorageError {
+    #[error("stored trust data is corrupt")]
+    Corrupt,
+    #[error("unsupported trust storage version {0}")]
+    UnsupportedVersion(u32),
+}
+
+/// Serialises peers for the platform keystore. The output contains presence
+/// keys, so treat it as a secret.
+pub fn encode_peers<'a>(peers: impl IntoIterator<Item = &'a TrustedPeer>) -> Zeroizing<Vec<u8>> {
+    let stored = StoredTrust {
+        version: STORAGE_VERSION,
+        peers: peers
+            .into_iter()
+            .map(|peer| StoredPeer {
+                signing_key: peer.identity.signing.as_bytes().to_vec(),
+                agreement_key: peer.identity.agreement.as_bytes().to_vec(),
+                presence_key: peer.presence_key.as_bytes().to_vec(),
+                name: peer.name.clone(),
+                paired_at_ms: peer.paired_at.as_millis(),
+            })
+            .collect(),
+    };
+    Zeroizing::new(stored.encode_to_vec())
+}
+
+/// # Errors
+/// Fails if the data is corrupt or from a newer version.
+pub fn decode_peers(bytes: &[u8]) -> Result<Vec<TrustedPeer>, StorageError> {
+    let stored = StoredTrust::decode(bytes).map_err(|_| StorageError::Corrupt)?;
+    if stored.version != STORAGE_VERSION {
+        return Err(StorageError::UnsupportedVersion(stored.version));
+    }
+    let key = |bytes: &[u8]| -> Result<[u8; 32], StorageError> {
+        bytes.try_into().map_err(|_| StorageError::Corrupt)
+    };
+    stored
+        .peers
+        .iter()
+        .map(|peer| {
+            Ok(TrustedPeer {
+                identity: PublicIdentity {
+                    signing: VerifyingKey::from_bytes(&key(&peer.signing_key)?)
+                        .map_err(|_| StorageError::Corrupt)?,
+                    agreement: AgreementPublicKey::from(key(&peer.agreement_key)?),
+                },
+                presence_key: PresenceKey::from_bytes(key(&peer.presence_key)?),
+                name: peer.name.clone(),
+                paired_at: Timestamp::from_millis(peer.paired_at_ms),
+            })
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedPeer {
@@ -109,5 +172,26 @@ mod tests {
 
         assert_eq!(store.remove(&id).unwrap(), Some(renamed));
         assert_eq!(store.get(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn storage_round_trip() {
+        let peers = vec![peer(1), peer(2)];
+        let bytes = encode_peers(&peers);
+        assert_eq!(decode_peers(&bytes).unwrap(), peers);
+        assert_eq!(decode_peers(&encode_peers(&[])).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn storage_rejects_garbage() {
+        assert_eq!(decode_peers(&[0xff, 0xff]), Err(StorageError::Corrupt));
+        let future = StoredTrust {
+            version: 2,
+            peers: vec![],
+        };
+        assert_eq!(
+            decode_peers(&future.encode_to_vec()),
+            Err(StorageError::UnsupportedVersion(2))
+        );
     }
 }

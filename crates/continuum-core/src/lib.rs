@@ -15,8 +15,10 @@
 pub mod clock;
 pub mod entropy;
 pub mod identity;
+pub mod pairing;
 pub mod presence;
 pub mod rid;
+pub mod session;
 pub mod sim;
 pub mod trust;
 

@@ -1,0 +1,27 @@
+[package]
+name = "continuum-linux"
+description = "Linux platform adapters for Continuum: Avahi, BlueZ and Secret Service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+continuum-core.workspace = true
+continuum-quickshare.workspace = true
+futures = "0.3"
+oo7 = { version = "0.7", default-features = false, features = ["tokio", "native_crypto"] }
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
