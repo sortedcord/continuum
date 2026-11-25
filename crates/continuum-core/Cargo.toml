@@ -1,0 +1,22 @@
+[package]
+name = "continuum-core"
+description = "Portable, I/O-free core of Continuum: identity, trust and presence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+continuum-proto.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

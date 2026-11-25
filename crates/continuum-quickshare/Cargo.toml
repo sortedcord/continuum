@@ -1,0 +1,16 @@
+[package]
+name = "continuum-quickshare"
+description = "Quick Share (Nearby Share) discovery compatibility for Continuum"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+continuum-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

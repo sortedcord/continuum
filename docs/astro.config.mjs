@@ -32,6 +32,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Ambient Presence & Proximity', slug: 'core/presence' },
 						{ label: 'Cryptographic Identity & Trust', slug: 'core/identity' },
+						{ label: 'Discovery Protocol (Spec)', slug: 'core/discovery-protocol' },
 					],
 				},
 				{

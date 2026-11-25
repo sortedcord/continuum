@@ -1,0 +1,67 @@
+// Continuum session protocol, version 1.
+//
+// These messages are only ever exchanged inside an authenticated, encrypted
+// session. Nothing in this file is sent in the clear.
+syntax = "proto3";
+
+package continuum.v1;
+
+enum DeviceKind {
+  DEVICE_KIND_UNSPECIFIED = 0;
+  DEVICE_KIND_PHONE = 1;
+  DEVICE_KIND_TABLET = 2;
+  DEVICE_KIND_LAPTOP = 3;
+  DEVICE_KIND_DESKTOP = 4;
+  DEVICE_KIND_SERVER = 5;
+}
+
+message DeviceInfo {
+  string name = 1;
+  DeviceKind kind = 2;
+  // Highest Continuum protocol version the device speaks.
+  uint32 protocol_version = 3;
+}
+
+// A versioned service the device offers, e.g. {"clipboard", 1}.
+message Capability {
+  string name = 1;
+  uint32 version = 2;
+}
+
+message CapabilityManifest {
+  repeated Capability capabilities = 1;
+}
+
+// First message each side sends after the handshake completes.
+message Hello {
+  DeviceInfo device = 1;
+  CapabilityManifest manifest = 2;
+}
+
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+message Goodbye {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_SHUTDOWN = 1;
+    REASON_UNPAIRED = 2;
+    REASON_PROTOCOL_ERROR = 3;
+  }
+  Reason reason = 1;
+}
+
+// Top-level frame for every message on a Continuum session.
+message Envelope {
+  oneof body {
+    Hello hello = 1;
+    Ping ping = 2;
+    Pong pong = 3;
+    Goodbye goodbye = 4;
+  }
+}
