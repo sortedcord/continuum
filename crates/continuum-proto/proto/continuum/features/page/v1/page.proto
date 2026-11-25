@@ -1,0 +1,24 @@
+// "Find My Device": make a paired device ring, even on silent.
+// Capability "page", version 1.
+syntax = "proto3";
+
+package continuum.features.page.v1;
+
+message Page {
+  oneof action {
+    Start start = 1;
+    Stop stop = 2;
+    Found found = 3;
+  }
+}
+
+// Ring until stopped or for `duration_s` seconds.
+message Start {
+  uint32 duration_s = 1;
+}
+
+// The pager cancelled.
+message Stop {}
+
+// The user found the device and silenced it.
+message Found {}

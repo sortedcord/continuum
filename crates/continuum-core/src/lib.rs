@@ -12,6 +12,7 @@
 //! [`entropy::Entropy`] source, so it can be tested without radios
 //! (see [`sim`]).
 
+pub mod capabilities;
 pub mod clock;
 pub mod entropy;
 pub mod identity;

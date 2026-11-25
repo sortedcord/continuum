@@ -13,6 +13,7 @@
 //! through `continuum-ffi` with NsdManager and the BLE APIs.
 
 mod addrs;
+pub mod features;
 mod node;
 pub mod pairing;
 pub mod records;
@@ -34,4 +35,10 @@ pub enum NodeError {
     TimedOut,
     #[error("the node has stopped")]
     Stopped,
+    #[error("that device is not paired")]
+    UnknownPeer,
+    #[error("that device is not connected")]
+    NotConnected,
+    #[error("the device does not support {0:?}")]
+    NotNegotiated(String),
 }

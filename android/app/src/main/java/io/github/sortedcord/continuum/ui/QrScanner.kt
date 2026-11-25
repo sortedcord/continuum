@@ -4,6 +4,8 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.runtime.Composable
@@ -40,7 +42,17 @@ fun QrScanner(modifier: Modifier = Modifier, onResult: (String) -> Unit) {
         providerFuture.addListener({
             val provider = providerFuture.get()
             val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
+            // 720p: QR codes on a laptop screen are small in the frame.
+            val resolution = ResolutionSelector.Builder()
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        android.util.Size(1280, 720),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                    ),
+                )
+                .build()
             val analysis = ImageAnalysis.Builder()
+                .setResolutionSelector(resolution)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()
                 .also { it.setAnalyzer(executor, QrAnalyzer(onResult)) }
@@ -57,7 +69,14 @@ fun QrScanner(modifier: Modifier = Modifier, onResult: (String) -> Unit) {
 
 private class QrAnalyzer(private val onResult: (String) -> Unit) : ImageAnalysis.Analyzer {
     private val reader = MultiFormatReader().apply {
-        setHints(mapOf(DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)))
+        setHints(
+            mapOf(
+                DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+                DecodeHintType.TRY_HARDER to true,
+                // Terminals with dark themes may render light-on-dark codes.
+                DecodeHintType.ALSO_INVERTED to true,
+            ),
+        )
     }
     private val delivered = AtomicBoolean(false)
 

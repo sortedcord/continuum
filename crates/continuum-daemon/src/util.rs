@@ -41,14 +41,23 @@ pub async fn confirm(question: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes")
 }
 
+/// Prints a QR code as dark-on-light, whatever the terminal theme: on a dark
+/// theme the plain block characters would render an inverted code, which
+/// many scanners reject.
 pub fn print_qr(text: &str) {
     match qrcode::QrCode::new(text.as_bytes()) {
         Ok(code) => {
             let rendered = code
                 .render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
                 .quiet_zone(true)
                 .build();
-            println!("{rendered}");
+            // Black text on a white background, so the "light" blocks we
+            // draw are white and the gaps are black modules.
+            for line in rendered.lines() {
+                println!("\x1b[97;40m{line}\x1b[0m");
+            }
         }
         Err(err) => eprintln!("could not render QR code: {err}"),
     }

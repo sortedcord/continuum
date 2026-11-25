@@ -1,0 +1,15 @@
+// Trust maintenance between paired devices. Capability "trust", version 1.
+syntax = "proto3";
+
+package continuum.features.trust.v1;
+
+message Trust {
+  oneof action {
+    // The sender rotated its presence key.
+    PresenceKey presence_key = 1;
+  }
+}
+
+message PresenceKey {
+  bytes key = 1;
+}

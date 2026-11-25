@@ -130,7 +130,11 @@ Needs Rust 1.89+, `protoc`, and running `avahi-daemon`, `bluetoothd` and a Secre
 cargo build --release -p continuum-daemon
 ./target/release/continuum pair invite   # show a QR code to pair a phone
 ./target/release/continuum run           # presence daemon
-./target/release/continuum peers
+./target/release/continuum peers         # live status via the daemon's D-Bus API
+./target/release/continuum page phone    # make it ring, even on silent
+./target/release/continuum radar phone   # live signal strength
+./target/release/continuum unpair phone  # mutual unpair + presence key rotation
+./target/release/continuum service install  # run as a systemd user service
 ```
 
 Two Linux machines can pair with `continuum pair join '<invite>'` or `continuum pair scan` (code comparison).

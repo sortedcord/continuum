@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use continuum_core::entropy::OsEntropy;
 use continuum_core::identity::{DeviceId, DeviceIdentity};
 use continuum_core::proto::PROTOCOL_VERSION;
-use continuum_core::proto::v1::{Capability, CapabilityManifest, DeviceInfo, DeviceKind, Hello};
+use continuum_core::proto::v1::{DeviceInfo, DeviceKind};
 use continuum_core::trust::TrustedPeer;
 use continuum_linux::keyring::Keyring;
 
@@ -48,26 +48,6 @@ impl Ctx {
         })
     }
 
-    pub fn hello(&self) -> Hello {
-        let capability = |name: &str| Capability {
-            name: name.into(),
-            version: 1,
-        };
-        Hello {
-            device: Some(self.device.clone()),
-            manifest: Some(CapabilityManifest {
-                capabilities: vec![capability("presence"), capability("ping")],
-            }),
-        }
-    }
-
-    pub fn peer_name(&self, id: &DeviceId) -> String {
-        self.peers
-            .iter()
-            .find(|peer| &peer.device_id() == id)
-            .map_or_else(|| short_id(id), |peer| peer.name.clone())
-    }
-
     /// Adds or replaces a peer and persists the trust store.
     pub async fn save_peer(&mut self, peer: TrustedPeer) -> anyhow::Result<()> {
         let id = peer.device_id();
@@ -77,25 +57,44 @@ impl Ctx {
         Ok(())
     }
 
+    /// Removes a peer and rotates our presence key so it can no longer
+    /// recognise our beacons. Remaining peers learn the new key in their
+    /// next session.
     pub async fn remove_peer(&mut self, id: &DeviceId) -> anyhow::Result<()> {
         self.peers.retain(|existing| &existing.device_id() != id);
         self.keyring.save_peers(&self.peers).await?;
+        let rotated = self.identity.with_new_presence_key(&mut OsEntropy);
+        self.keyring.save_identity(&rotated).await?;
+        self.identity = Arc::new(rotated);
         Ok(())
     }
 
     /// Finds a peer by device id prefix or exact name.
     pub fn find_peer(&self, needle: &str) -> anyhow::Result<&TrustedPeer> {
-        let matches: Vec<_> = self
-            .peers
-            .iter()
-            .filter(|peer| peer.device_id().to_string().starts_with(needle) || peer.name == needle)
-            .collect();
-        match matches.as_slice() {
+        match match_peers(&self.peers, needle).as_slice() {
             [peer] => Ok(peer),
             [] => anyhow::bail!("no paired device matches {needle:?}"),
             _ => anyhow::bail!("{needle:?} matches several devices; use a longer id prefix"),
         }
     }
+}
+
+/// Finds peers by id prefix, then exact name, then name substring (all
+/// case-insensitive), stopping at the first rule that matches anything.
+pub fn match_peers<'a>(peers: &'a [TrustedPeer], needle: &str) -> Vec<&'a TrustedPeer> {
+    let needle = needle.to_lowercase();
+    let rules: [&dyn Fn(&TrustedPeer) -> bool; 3] = [
+        &|p| p.device_id().to_string().starts_with(&needle),
+        &|p| p.name.to_lowercase() == needle,
+        &|p| p.name.to_lowercase().contains(&needle),
+    ];
+    for rule in rules {
+        let found: Vec<_> = peers.iter().filter(|p| rule(p)).collect();
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    Vec::new()
 }
 
 pub fn short_id(id: &DeviceId) -> String {

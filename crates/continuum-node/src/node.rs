@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use continuum_core::capabilities::{Negotiated, capability, negotiate};
 use continuum_core::clock::{Clock, SystemClock, Timestamp};
 use continuum_core::entropy::OsEntropy;
 use continuum_core::identity::{DeviceId, DeviceIdentity};
@@ -13,12 +14,16 @@ use continuum_core::presence::{
 };
 use continuum_core::proto::ResolvableId;
 use continuum_core::proto::beacon::{BEACON_LEN, Beacon, BeaconFlags};
-use continuum_core::proto::v1::{Hello, envelope};
-use continuum_core::rid::RotatingId;
+use continuum_core::proto::features::trust::v1 as trust;
+use continuum_core::proto::v1::{
+    Capability, CapabilityManifest, DeviceInfo, FeatureMessage, Goodbye, Hello, envelope, goodbye,
+};
+use continuum_core::rid::{PresenceKey, RotatingId};
 use continuum_core::trust::TrustedPeer;
 use continuum_net::{
-    Intent, SessionLink, accept_session, connect_session, read_preamble, spawn_link,
+    Intent, LinkClosed, SessionLink, accept_session, connect_session, read_preamble, spawn_link,
 };
+use prost::Message;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -32,12 +37,25 @@ use crate::{NodeError, connect_any, rank_addrs};
 const CONNECT_GRACE: Duration = Duration::from_secs(10);
 const RETRY_AFTER: Duration = Duration::from_secs(15);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// RSSI-only status updates: at most this often per peer...
+const RSSI_UPDATE_EVERY: Duration = Duration::from_millis(500);
+/// ...and only if the smoothed RSSI moved at least this much (dB).
+const RSSI_UPDATE_DELTA: f32 = 1.0;
+
+/// Capabilities the node implements itself.
+const TRUST: &str = "trust";
+
+fn built_in_capabilities() -> Vec<Capability> {
+    vec![capability("presence", 1, 1), capability(TRUST, 1, 1)]
+}
 
 #[derive(Debug)]
 pub struct NodeConfig {
     pub identity: Arc<DeviceIdentity>,
     pub peers: Vec<TrustedPeer>,
-    pub hello: Hello,
+    pub device: DeviceInfo,
+    /// Features the platform implements, on top of the built-in ones.
+    pub capabilities: Vec<Capability>,
     /// Where to accept sessions; port 0 picks a free port.
     pub listen: SocketAddr,
     pub keepalive: Duration,
@@ -46,11 +64,12 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn new(identity: Arc<DeviceIdentity>, peers: Vec<TrustedPeer>, hello: Hello) -> Self {
+    pub fn new(identity: Arc<DeviceIdentity>, peers: Vec<TrustedPeer>, device: DeviceInfo) -> Self {
         Self {
             identity,
             peers,
-            hello,
+            device,
+            capabilities: Vec::new(),
             listen: SocketAddr::from(([0u16; 8], 0)),
             keepalive: Duration::from_secs(10),
             rotation: RotatingId::DEFAULT_INTERVAL,
@@ -80,6 +99,8 @@ pub struct PeerStatus {
     pub band: Option<ProximityBand>,
     pub rssi: Option<f32>,
     pub addrs: Vec<SocketAddr>,
+    /// Features usable with this peer right now (empty when disconnected).
+    pub capabilities: Negotiated,
 }
 
 #[derive(Debug, Clone)]
@@ -93,10 +114,17 @@ pub enum NodeEvent {
     SessionUp {
         peer: DeviceId,
         hello: Hello,
+        capabilities: Negotiated,
     },
     SessionDown {
         peer: DeviceId,
         reason: String,
+    },
+    /// A stored peer changed (e.g. it rotated its presence key); persist it.
+    PeerUpdated(TrustedPeer),
+    /// The peer unpaired us; remove it from persistent storage.
+    Unpaired {
+        peer: DeviceId,
     },
     /// A device in pairing mode was seen (or is gone).
     PairingCandidate {
@@ -105,10 +133,12 @@ pub enum NodeEvent {
         addr: Option<SocketAddr>,
         present: bool,
     },
-    /// An application message from a peer.
-    Message {
+    /// A message for a negotiated feature.
+    Feature {
         peer: DeviceId,
-        body: envelope::Body,
+        capability: String,
+        version: u32,
+        body: Vec<u8>,
     },
 }
 
@@ -126,9 +156,16 @@ enum Command {
         rssi: i16,
     },
     SetPeers(Vec<TrustedPeer>),
-    Send {
+    Unpair {
         peer: DeviceId,
-        body: envelope::Body,
+        reply: oneshot::Sender<Result<(), NodeError>>,
+    },
+    SetIdentity(Arc<DeviceIdentity>),
+    Feature {
+        peer: DeviceId,
+        capability: String,
+        body: Vec<u8>,
+        reply: oneshot::Sender<Result<(), NodeError>>,
     },
     Snapshot(oneshot::Sender<Vec<PeerStatus>>),
     Shutdown(oneshot::Sender<()>),
@@ -149,6 +186,15 @@ impl NodeHandle {
 
     async fn command(&self, command: Command) -> Result<(), NodeError> {
         self.tx.send(command).await.map_err(|_| NodeError::Stopped)
+    }
+
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, NodeError>>) -> Command,
+    ) -> Result<T, NodeError> {
+        let (tx, rx) = oneshot::channel();
+        self.command(make(tx)).await?;
+        rx.await.map_err(|_| NodeError::Stopped)?
     }
 
     /// Reports a resolved `_continuum._tcp` service. Non-Continuum or
@@ -181,7 +227,8 @@ impl NodeHandle {
         self.command(Command::Ble { data, rssi }).await
     }
 
-    /// Replaces the trust store, e.g. after pairing or unpairing.
+    /// Replaces the trust store, e.g. after pairing. Sessions with peers
+    /// that are no longer listed are closed.
     ///
     /// # Errors
     /// Fails if the node has stopped.
@@ -189,12 +236,43 @@ impl NodeHandle {
         self.command(Command::SetPeers(peers)).await
     }
 
-    /// Sends a message on the session with `peer`, if one is up.
+    /// Forgets `peer` and tells it so, if connected, so it forgets us too.
+    /// The caller should also rotate the presence key with
+    /// [`Self::set_identity`], so the removed peer can no longer track us.
+    ///
+    /// # Errors
+    /// Fails if `peer` isn't paired or the node has stopped.
+    pub async fn unpair(&self, peer: DeviceId) -> Result<(), NodeError> {
+        self.request(|reply| Command::Unpair { peer, reply }).await
+    }
+
+    /// Switches to an identity with a new presence key. Connected peers are
+    /// sent the new key at once; others get it in the next session's Hello.
     ///
     /// # Errors
     /// Fails if the node has stopped.
-    pub async fn send(&self, peer: DeviceId, body: envelope::Body) -> Result<(), NodeError> {
-        self.command(Command::Send { peer, body }).await
+    pub async fn set_identity(&self, identity: Arc<DeviceIdentity>) -> Result<(), NodeError> {
+        self.command(Command::SetIdentity(identity)).await
+    }
+
+    /// Sends a feature message to a connected peer.
+    ///
+    /// # Errors
+    /// Fails if the peer isn't connected or didn't negotiate `capability`.
+    pub async fn send_feature(
+        &self,
+        peer: DeviceId,
+        capability: &str,
+        body: Vec<u8>,
+    ) -> Result<(), NodeError> {
+        let capability = capability.to_owned();
+        self.request(|reply| Command::Feature {
+            peer,
+            capability,
+            body,
+            reply,
+        })
+        .await
     }
 
     /// Current status of every paired peer.
@@ -242,7 +320,7 @@ enum Internal {
     },
     Down {
         peer: DeviceId,
-        reason: String,
+        reason: LinkClosed,
     },
     ConnectFailed {
         peer: DeviceId,
@@ -256,14 +334,17 @@ enum Internal {
 struct Live {
     sender: mpsc::Sender<envelope::Body>,
     initiated: bool,
+    capabilities: Negotiated,
 }
 
 struct Node {
     identity: Arc<DeviceIdentity>,
     our_id: DeviceId,
     peers: Vec<TrustedPeer>,
-    hello: Hello,
+    device: DeviceInfo,
+    capabilities: Vec<Capability>,
     keepalive: Duration,
+    rotation: Duration,
     port: u16,
     clock: SystemClock,
     rotating: RotatingId,
@@ -272,9 +353,19 @@ struct Node {
     connecting: HashSet<DeviceId>,
     last_attempt: HashMap<DeviceId, Timestamp>,
     reachable_since: HashMap<DeviceId, Timestamp>,
+    /// Last RSSI reported per peer, for throttling radar updates.
+    last_rssi: HashMap<DeviceId, (Timestamp, f32)>,
     events: mpsc::Sender<NodeEvent>,
     internal_tx: mpsc::Sender<Internal>,
     internal_rx: Option<mpsc::Receiver<Internal>>,
+}
+
+fn feature(capability: &str, version: u32, body: Vec<u8>) -> envelope::Body {
+    envelope::Body::Feature(FeatureMessage {
+        capability: capability.to_owned(),
+        version,
+        body,
+    })
 }
 
 impl Node {
@@ -282,13 +373,17 @@ impl Node {
         let mut registry = PresenceRegistry::new(config.registry);
         registry.set_trusted_peers(&config.peers);
         let (internal_tx, internal_rx) = mpsc::channel(64);
+        let mut capabilities = built_in_capabilities();
+        capabilities.extend(config.capabilities);
         Self {
             our_id: config.identity.device_id(),
             rotating: RotatingId::new(config.identity.presence_key().clone(), config.rotation),
             identity: config.identity,
             peers: config.peers,
-            hello: config.hello,
+            device: config.device,
+            capabilities,
             keepalive: config.keepalive,
+            rotation: config.rotation,
             port,
             clock: SystemClock,
             registry,
@@ -296,9 +391,20 @@ impl Node {
             connecting: HashSet::new(),
             last_attempt: HashMap::new(),
             reachable_since: HashMap::new(),
+            last_rssi: HashMap::new(),
             events,
             internal_tx,
             internal_rx: Some(internal_rx),
+        }
+    }
+
+    fn hello(&self) -> Hello {
+        Hello {
+            device: Some(self.device.clone()),
+            manifest: Some(CapabilityManifest {
+                capabilities: self.capabilities.clone(),
+            }),
+            presence_key: self.identity.presence_key().as_bytes().to_vec(),
         }
     }
 
@@ -320,15 +426,17 @@ impl Node {
         let presence = self.registry.presence(&id);
         let ble = presence.and_then(|p| p.ble.as_ref());
         let lan = presence.and_then(|p| p.lan.as_ref());
+        let live = self.sessions.get(&id);
         PeerStatus {
             id,
             name: peer.name.clone(),
             nearby: ble.is_some(),
             reachable: lan.is_some(),
-            connected: self.sessions.contains_key(&id),
+            connected: live.is_some(),
             band: ble.and_then(|b| b.band),
             rssi: ble.and_then(|b| b.rssi),
             addrs: lan.map(|l| rank_addrs(l.addrs())).unwrap_or_default(),
+            capabilities: live.map(|l| l.capabilities.clone()).unwrap_or_default(),
         }
     }
 
@@ -376,6 +484,29 @@ impl Node {
         }
     }
 
+    /// Streams RSSI changes (for radars) without flooding the platform.
+    async fn maybe_report_rssi(&mut self, id: &ResolvableId, now: Timestamp) {
+        let Some(peer) = self.registry.resolve_peer(id) else {
+            return;
+        };
+        let Some(rssi) = self
+            .registry
+            .presence(&peer)
+            .and_then(|p| p.ble.as_ref())
+            .and_then(|ble| ble.rssi)
+        else {
+            return;
+        };
+        let due = self.last_rssi.get(&peer).is_none_or(|(at, last)| {
+            now.saturating_since(*at) >= RSSI_UPDATE_EVERY
+                && (rssi - last).abs() >= RSSI_UPDATE_DELTA
+        });
+        if due {
+            self.last_rssi.insert(peer, (now, rssi));
+            self.emit_status(&peer).await;
+        }
+    }
+
     fn maybe_connect(&mut self, now: Timestamp) {
         let candidates: Vec<(DeviceId, Vec<SocketAddr>)> = self
             .registry
@@ -402,12 +533,39 @@ impl Node {
                     addrs,
                     self.identity.clone(),
                     trusted.clone(),
-                    self.hello.clone(),
+                    self.hello(),
                     self.internal_tx.clone(),
                     self.keepalive,
                 ));
             }
         }
+    }
+
+    /// Adopts a presence key a peer announced, if it changed.
+    async fn update_presence_key(&mut self, peer: DeviceId, key: &[u8]) {
+        let Ok(key) = <[u8; 32]>::try_from(key) else {
+            return;
+        };
+        let key = PresenceKey::from_bytes(key);
+        let Some(stored) = self.peers.iter_mut().find(|p| p.device_id() == peer) else {
+            return;
+        };
+        if stored.presence_key == key {
+            return;
+        }
+        stored.presence_key = key;
+        let updated = stored.clone();
+        let events = self.registry.set_trusted_peers(&self.peers);
+        self.handle_presence(events).await;
+        tracing::info!(peer = %peer, "peer rotated its presence key");
+        self.emit(NodeEvent::PeerUpdated(updated)).await;
+    }
+
+    async fn forget(&mut self, peer: DeviceId) {
+        self.peers.retain(|p| p.device_id() != peer);
+        self.sessions.remove(&peer);
+        let events = self.registry.set_trusted_peers(&self.peers);
+        self.handle_presence(events).await;
     }
 
     async fn handle_internal(&mut self, event: Internal) {
@@ -422,35 +580,194 @@ impl Node {
                 {
                     return;
                 }
+                let hello = link.hello.clone();
+                let theirs = hello
+                    .manifest
+                    .as_ref()
+                    .map(|m| m.capabilities.as_slice())
+                    .unwrap_or_default();
+                let capabilities = negotiate(&self.capabilities, theirs);
                 self.sessions.insert(
                     peer,
                     Live {
                         sender: link.sender(),
                         initiated,
+                        capabilities: capabilities.clone(),
                     },
                 );
-                let hello = link.hello.clone();
                 tokio::spawn(watch(*link, self.internal_tx.clone()));
-                self.emit(NodeEvent::SessionUp { peer, hello }).await;
+                self.update_presence_key(peer, &hello.presence_key).await;
+                self.emit(NodeEvent::SessionUp {
+                    peer,
+                    hello,
+                    capabilities,
+                })
+                .await;
                 self.emit_status(&peer).await;
             }
             Internal::Down { peer, reason } => {
                 // Ignore the end of a duplicate we already replaced.
-                if self
+                if !self
                     .sessions
                     .get(&peer)
                     .is_some_and(|live| live.sender.is_closed())
                 {
-                    self.sessions.remove(&peer);
-                    self.emit(NodeEvent::SessionDown { peer, reason }).await;
+                    return;
+                }
+                self.sessions.remove(&peer);
+                let unpaired = matches!(
+                    reason,
+                    LinkClosed::Goodbye(code) if code == i32::from(goodbye::Reason::Unpaired)
+                );
+                self.emit(NodeEvent::SessionDown {
+                    peer,
+                    reason: format!("{reason:?}"),
+                })
+                .await;
+                if unpaired && self.peers.iter().any(|p| p.device_id() == peer) {
+                    self.forget(peer).await;
+                    self.emit(NodeEvent::Unpaired { peer }).await;
+                } else {
                     self.emit_status(&peer).await;
                 }
             }
             Internal::ConnectFailed { peer } => {
                 self.connecting.remove(&peer);
             }
-            Internal::Message { peer, body } => self.emit(NodeEvent::Message { peer, body }).await,
+            Internal::Message { peer, body } => {
+                let envelope::Body::Feature(message) = body else {
+                    return;
+                };
+                let Some(&version) = self
+                    .sessions
+                    .get(&peer)
+                    .and_then(|live| live.capabilities.get(&message.capability))
+                else {
+                    tracing::debug!(capability = %message.capability, "dropping un-negotiated feature message");
+                    return;
+                };
+                if message.capability == TRUST {
+                    if let Ok(trust::Trust {
+                        action: Some(trust::trust::Action::PresenceKey(key)),
+                    }) = trust::Trust::decode(message.body.as_slice())
+                    {
+                        self.update_presence_key(peer, &key.key).await;
+                    }
+                    return;
+                }
+                self.emit(NodeEvent::Feature {
+                    peer,
+                    capability: message.capability,
+                    version,
+                    body: message.body,
+                })
+                .await;
+            }
         }
+    }
+
+    #[allow(clippy::too_many_lines)] // One arm per command.
+    async fn handle_command(&mut self, command: Command) -> bool {
+        let now = self.clock.now();
+        match command {
+            Command::Lan { name, txt, addr } => {
+                if let Some(obs) = lan_observation(&name, &txt, addr, now) {
+                    let events = self.registry.ingest(&obs);
+                    self.handle_presence(events).await;
+                }
+            }
+            Command::LanRemoved { name } => {
+                if let Some(id) = continuum_id(&name) {
+                    let events = self.registry.withdraw(Transport::Lan, &id);
+                    self.handle_presence(events).await;
+                }
+            }
+            Command::Ble { data, rssi } => {
+                if let Some(obs) = ble_observation(&data, rssi, now) {
+                    let events = self.registry.ingest(&obs);
+                    let changed = !events.is_empty();
+                    self.handle_presence(events).await;
+                    if !changed {
+                        self.maybe_report_rssi(&obs.id, now).await;
+                    }
+                }
+            }
+            Command::SetPeers(peers) => {
+                self.peers = peers;
+                let trusted: HashSet<DeviceId> =
+                    self.peers.iter().map(TrustedPeer::device_id).collect();
+                self.sessions.retain(|id, _| trusted.contains(id));
+                let events = self.registry.set_trusted_peers(&self.peers);
+                self.handle_presence(events).await;
+            }
+            Command::Unpair { peer, reply } => {
+                if !self.peers.iter().any(|p| p.device_id() == peer) {
+                    let _ = reply.send(Err(NodeError::UnknownPeer));
+                    return true;
+                }
+                if let Some(live) = self.sessions.get(&peer) {
+                    let goodbye = Goodbye {
+                        reason: goodbye::Reason::Unpaired.into(),
+                    };
+                    let _ = live.sender.send(envelope::Body::Goodbye(goodbye)).await;
+                }
+                self.forget(peer).await;
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetIdentity(identity) => {
+                self.identity = identity;
+                self.rotating =
+                    RotatingId::new(self.identity.presence_key().clone(), self.rotation);
+                let (id, _) = self.rotating.current(now, &mut OsEntropy);
+                self.emit(NodeEvent::Advertise(self.advertisement(id)))
+                    .await;
+                let body = trust::Trust {
+                    action: Some(trust::trust::Action::PresenceKey(trust::PresenceKey {
+                        key: self.identity.presence_key().as_bytes().to_vec(),
+                    })),
+                }
+                .encode_to_vec();
+                for live in self.sessions.values() {
+                    if let Some(&version) = live.capabilities.get(TRUST) {
+                        let _ = live
+                            .sender
+                            .send(feature(TRUST, version, body.clone()))
+                            .await;
+                    }
+                }
+            }
+            Command::Feature {
+                peer,
+                capability,
+                body,
+                reply,
+            } => {
+                let result = match self.sessions.get(&peer) {
+                    None => Err(NodeError::NotConnected),
+                    Some(live) => match live.capabilities.get(&capability) {
+                        None => Err(NodeError::NotNegotiated(capability.clone())),
+                        Some(&version) => live
+                            .sender
+                            .send(feature(&capability, version, body))
+                            .await
+                            .map_err(|_| NodeError::NotConnected),
+                    },
+                };
+                let _ = reply.send(result);
+            }
+            Command::Snapshot(reply) => {
+                let statuses = self.peers.iter().map(|p| self.status(p)).collect();
+                let _ = reply.send(statuses);
+            }
+            Command::Shutdown(reply) => {
+                self.sessions.clear();
+                // Give links a moment to send their goodbyes.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = reply.send(());
+                return false;
+            }
+        }
+        true
     }
 
     async fn run(mut self, listener: TcpListener, mut commands: mpsc::Receiver<Command>) {
@@ -468,7 +785,7 @@ impl Node {
                             stream,
                             self.identity.clone(),
                             self.peers.clone(),
-                            self.hello.clone(),
+                            self.hello(),
                             self.internal_tx.clone(),
                             self.keepalive,
                         ));
@@ -476,50 +793,8 @@ impl Node {
                 }
                 command = commands.recv() => {
                     let Some(command) = command else { break };
-                    let now = self.clock.now();
-                    match command {
-                        Command::Lan { name, txt, addr } => {
-                            if let Some(obs) = lan_observation(&name, &txt, addr, now) {
-                                let events = self.registry.ingest(&obs);
-                                self.handle_presence(events).await;
-                            }
-                        }
-                        Command::LanRemoved { name } => {
-                            if let Some(id) = continuum_id(&name) {
-                                let events = self.registry.withdraw(Transport::Lan, &id);
-                                self.handle_presence(events).await;
-                            }
-                        }
-                        Command::Ble { data, rssi } => {
-                            if let Some(obs) = ble_observation(&data, rssi, now) {
-                                let events = self.registry.ingest(&obs);
-                                self.handle_presence(events).await;
-                            }
-                        }
-                        Command::SetPeers(peers) => {
-                            self.peers = peers;
-                            let trusted: HashSet<DeviceId> = self.peers.iter().map(TrustedPeer::device_id).collect();
-                            // Close sessions with peers that are no longer trusted.
-                            self.sessions.retain(|id, _| trusted.contains(id));
-                            let events = self.registry.set_trusted_peers(&self.peers);
-                            self.handle_presence(events).await;
-                        }
-                        Command::Send { peer, body } => {
-                            if let Some(live) = self.sessions.get(&peer) {
-                                let _ = live.sender.send(body).await;
-                            }
-                        }
-                        Command::Snapshot(reply) => {
-                            let statuses = self.peers.iter().map(|p| self.status(p)).collect();
-                            let _ = reply.send(statuses);
-                        }
-                        Command::Shutdown(reply) => {
-                            self.sessions.clear();
-                            // Give links a moment to send their goodbyes.
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            let _ = reply.send(());
-                            return;
-                        }
+                    if !self.handle_command(command).await {
+                        return;
                     }
                 }
                 Some(event) = internal.recv() => self.handle_internal(event).await,
@@ -618,10 +893,11 @@ async fn watch(link: SessionLink, internal: mpsc::Sender<Internal>) {
             let _ = forward.send(Internal::Message { peer, body }).await;
         }
     });
-    let reason = match closed.await {
-        Ok(reason) => format!("{reason:?}"),
-        Err(_) => "dropped".into(),
-    };
+    let reason = closed
+        .await
+        .unwrap_or(LinkClosed::Error(continuum_net::NetError::Protocol(
+            "dropped",
+        )));
     let _ = internal.send(Internal::Down { peer, reason }).await;
 }
 
@@ -629,7 +905,6 @@ async fn watch(link: SessionLink, internal: mpsc::Sender<Internal>) {
 mod tests {
     use continuum_core::clock::Timestamp;
     use continuum_core::entropy::DeterministicEntropy;
-    use continuum_core::proto::v1::DeviceInfo;
 
     use super::*;
 
@@ -648,13 +923,10 @@ mod tests {
         }
     }
 
-    fn hello(name: &str) -> Hello {
-        Hello {
-            device: Some(DeviceInfo {
-                name: name.into(),
-                ..Default::default()
-            }),
-            manifest: None,
+    fn device(name: &str) -> DeviceInfo {
+        DeviceInfo {
+            name: name.into(),
+            ..Default::default()
         }
     }
 
@@ -664,32 +936,66 @@ mod tests {
         name: &str,
         other_name: &str,
     ) -> NodeConfig {
-        let mut config = NodeConfig::new(me.clone(), vec![trusted(other, other_name)], hello(name));
+        let mut config =
+            NodeConfig::new(me.clone(), vec![trusted(other, other_name)], device(name));
         config.listen = "127.0.0.1:0".parse().unwrap();
+        config.capabilities = vec![capability("page", 1, 1)];
         config
     }
 
-    async fn next_advert(events: &mut mpsc::Receiver<NodeEvent>) -> Advertisement {
-        loop {
-            if let Some(NodeEvent::Advertise(ad)) = events.recv().await {
-                return ad;
+    async fn next<T>(
+        events: &mut mpsc::Receiver<NodeEvent>,
+        mut pick: impl FnMut(NodeEvent) -> Option<T>,
+    ) -> T {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let event = events.recv().await.expect("node stopped");
+                if let Some(found) = pick(event) {
+                    return found;
+                }
             }
-        }
+        })
+        .await
+        .expect("timed out waiting for event")
     }
 
-    async fn wait_session(events: &mut mpsc::Receiver<NodeEvent>) -> (DeviceId, Hello) {
-        loop {
-            match events.recv().await {
-                Some(NodeEvent::SessionUp { peer, hello }) => return (peer, hello),
-                Some(_) => {}
-                None => panic!("node stopped"),
-            }
-        }
+    async fn advert(events: &mut mpsc::Receiver<NodeEvent>) -> Advertisement {
+        next(events, |e| match e {
+            NodeEvent::Advertise(ad) => Some(ad),
+            _ => None,
+        })
+        .await
     }
 
-    /// Two nodes discover each other via (simulated) mDNS and connect.
-    #[tokio::test]
-    async fn nodes_find_each_other_and_connect() {
+    async fn session_up(events: &mut mpsc::Receiver<NodeEvent>) -> (DeviceId, Hello, Negotiated) {
+        next(events, |e| match e {
+            NodeEvent::SessionUp {
+                peer,
+                hello,
+                capabilities,
+            } => Some((peer, hello, capabilities)),
+            _ => None,
+        })
+        .await
+    }
+
+    struct Pair {
+        a: NodeHandle,
+        a_events: mpsc::Receiver<NodeEvent>,
+        b: NodeHandle,
+        b_events: mpsc::Receiver<NodeEvent>,
+        laptop: Arc<DeviceIdentity>,
+        phone: Arc<DeviceIdentity>,
+        a_ad: Advertisement,
+        b_ad: Advertisement,
+    }
+
+    fn local(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// Two nodes that have discovered each other via (simulated) mDNS.
+    async fn connected_pair() -> Pair {
         let (laptop, phone) = (identity(1), identity(2));
         let (a, mut a_events) = start(config(&laptop, &phone, "Laptop", "Phone"))
             .await
@@ -697,12 +1003,7 @@ mod tests {
         let (b, mut b_events) = start(config(&phone, &laptop, "Phone", "Laptop"))
             .await
             .unwrap();
-        let (a_ad, b_ad) = (
-            next_advert(&mut a_events).await,
-            next_advert(&mut b_events).await,
-        );
-
-        let local = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let (a_ad, b_ad) = (advert(&mut a_events).await, advert(&mut b_events).await);
         a.observe_lan(
             b_ad.record.name.clone(),
             b_ad.record.txt.clone(),
@@ -717,37 +1018,130 @@ mod tests {
         )
         .await
         .unwrap();
-        // BLE sightings feed the same registry.
-        a.observe_ble(b_ad.beacon.to_vec(), -50).await.unwrap();
+        Pair {
+            a,
+            a_events,
+            b,
+            b_events,
+            laptop,
+            phone,
+            a_ad,
+            b_ad,
+        }
+    }
 
-        let timeout = Duration::from_secs(20);
-        let (peer, hello) = tokio::time::timeout(timeout, wait_session(&mut a_events))
-            .await
-            .unwrap();
-        assert_eq!(peer, phone.device_id());
+    #[tokio::test]
+    async fn nodes_find_each_other_and_negotiate() {
+        let mut p = connected_pair().await;
+        p.a.observe_ble(p.b_ad.beacon.to_vec(), -50).await.unwrap();
+
+        let (peer, hello, capabilities) = session_up(&mut p.a_events).await;
+        assert_eq!(peer, p.phone.device_id());
         assert_eq!(hello.device.unwrap().name, "Phone");
-        let (peer, _) = tokio::time::timeout(timeout, wait_session(&mut b_events))
-            .await
-            .unwrap();
-        assert_eq!(peer, laptop.device_id());
+        assert_eq!(capabilities.get("page"), Some(&1));
+        assert_eq!(capabilities.get("trust"), Some(&1));
+        let (peer, _, _) = session_up(&mut p.b_events).await;
+        assert_eq!(peer, p.laptop.device_id());
 
-        let snapshot = a.snapshot().await.unwrap();
-        assert_eq!(snapshot.len(), 1);
+        let snapshot = p.a.snapshot().await.unwrap();
         let status = &snapshot[0];
         assert!(status.connected && status.reachable && status.nearby);
         assert_eq!(status.band, Some(ProximityBand::Immediate));
+        assert!(status.capabilities.contains_key("page"));
 
-        a.shutdown().await.unwrap();
-        let down = tokio::time::timeout(timeout, async {
-            loop {
-                if let Some(NodeEvent::SessionDown { peer, .. }) = b_events.recv().await {
-                    return peer;
-                }
-            }
+        p.a.shutdown().await.unwrap();
+        let down = next(&mut p.b_events, |e| match e {
+            NodeEvent::SessionDown { peer, .. } => Some(peer),
+            _ => None,
         })
-        .await
-        .unwrap();
-        assert_eq!(down, laptop.device_id());
+        .await;
+        assert_eq!(down, p.laptop.device_id());
+        let _ = p.a_ad;
+    }
+
+    #[tokio::test]
+    async fn feature_messages_flow_only_when_negotiated() {
+        let mut p = connected_pair().await;
+        session_up(&mut p.a_events).await;
+        session_up(&mut p.b_events).await;
+
+        p.a.send_feature(p.phone.device_id(), "page", b"ring".to_vec())
+            .await
+            .unwrap();
+        let (capability, version, body) = next(&mut p.b_events, |e| match e {
+            NodeEvent::Feature {
+                capability,
+                version,
+                body,
+                ..
+            } => Some((capability, version, body)),
+            _ => None,
+        })
+        .await;
+        assert_eq!(
+            (capability.as_str(), version, body.as_slice()),
+            ("page", 1, b"ring".as_slice())
+        );
+
+        let err =
+            p.a.send_feature(p.phone.device_id(), "sidecar", vec![])
+                .await
+                .unwrap_err();
+        assert!(matches!(err, NodeError::NotNegotiated(_)));
+        let stranger = identity(9).device_id();
+        let err =
+            p.a.send_feature(stranger, "page", vec![])
+                .await
+                .unwrap_err();
+        assert!(matches!(err, NodeError::NotConnected));
+    }
+
+    #[tokio::test]
+    async fn rotated_presence_key_reaches_connected_peer() {
+        let mut p = connected_pair().await;
+        session_up(&mut p.a_events).await;
+        session_up(&mut p.b_events).await;
+
+        let rotated = Arc::new(
+            p.laptop
+                .with_new_presence_key(&mut DeterministicEntropy::new(42)),
+        );
+        p.a.set_identity(rotated.clone()).await.unwrap();
+        let new_ad = advert(&mut p.a_events).await;
+        assert_ne!(new_ad.id, p.a_ad.id);
+
+        let updated = next(&mut p.b_events, |e| match e {
+            NodeEvent::PeerUpdated(peer) => Some(peer),
+            _ => None,
+        })
+        .await;
+        assert_eq!(updated.device_id(), p.laptop.device_id());
+        assert_eq!(&updated.presence_key, rotated.presence_key());
+
+        // The phone can now resolve the laptop's new beacon.
+        p.b.observe_ble(new_ad.beacon.to_vec(), -60).await.unwrap();
+        let status = p.b.snapshot().await.unwrap().remove(0);
+        assert!(status.nearby);
+    }
+
+    #[tokio::test]
+    async fn unpairing_one_side_unpairs_both() {
+        let mut p = connected_pair().await;
+        session_up(&mut p.a_events).await;
+        session_up(&mut p.b_events).await;
+
+        p.a.unpair(p.phone.device_id()).await.unwrap();
+        assert!(p.a.snapshot().await.unwrap().is_empty());
+        let gone = next(&mut p.b_events, |e| match e {
+            NodeEvent::Unpaired { peer } => Some(peer),
+            _ => None,
+        })
+        .await;
+        assert_eq!(gone, p.laptop.device_id());
+        assert!(p.b.snapshot().await.unwrap().is_empty());
+
+        let err = p.a.unpair(p.phone.device_id()).await.unwrap_err();
+        assert!(matches!(err, NodeError::UnknownPeer));
     }
 
     #[tokio::test]
@@ -756,14 +1150,13 @@ mod tests {
         let (a, mut a_events) = start(config(&laptop, &phone, "Laptop", "Phone"))
             .await
             .unwrap();
-        next_advert(&mut a_events).await;
+        advert(&mut a_events).await;
         let mut entropy = DeterministicEntropy::new(9);
         let id = stranger.presence_key().generate_id(&mut entropy);
         let record = continuum_record(id, 1, BeaconFlags::LAN);
         a.observe_lan(record.name, record.txt, "127.0.0.1:1".parse().unwrap())
             .await
             .unwrap();
-        let snapshot = a.snapshot().await.unwrap();
-        assert!(!snapshot[0].reachable);
+        assert!(!a.snapshot().await.unwrap()[0].reachable);
     }
 }

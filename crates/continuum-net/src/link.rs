@@ -217,6 +217,7 @@ mod tests {
         Hello {
             device: Some(DeviceInfo::default()),
             manifest: None,
+            presence_key: Vec::new(),
         }
     }
 

@@ -1,9 +1,12 @@
 //! `continuum`: Continuum daemon and CLI for Linux.
 
 mod ctx;
+mod dbus;
 mod pair;
 mod quickshare;
+mod ring;
 mod run;
+mod service;
 mod util;
 
 use std::net::SocketAddr;
@@ -36,8 +39,17 @@ struct Cli {
 enum Command {
     /// Show this device's identity.
     Id,
-    /// List paired devices.
+    /// List paired devices (with live presence if the daemon is running).
     Peers,
+    /// Make a paired device ring, even on silent.
+    Page {
+        device: String,
+        /// How long to ring.
+        #[arg(long, default_value_t = 30)]
+        seconds: u32,
+    },
+    /// Show a device's distance live.
+    Radar { device: String },
     /// Pair with another device.
     Pair {
         #[command(subcommand)]
@@ -61,6 +73,11 @@ enum Command {
     Quickshare {
         #[command(subcommand)]
         action: QuickshareAction,
+    },
+    /// Install or remove the daemon as a systemd user service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
     /// Delete this profile's identity and paired devices.
     Reset {
@@ -92,6 +109,14 @@ enum PairAction {
 }
 
 #[derive(Subcommand)]
+enum ServiceAction {
+    /// Write ~/.config/systemd/user/continuum.service and start it.
+    Install,
+    /// Stop and remove the user service.
+    Uninstall,
+}
+
+#[derive(Subcommand)]
 enum QuickshareAction {
     /// Wake nearby Android receivers and list Quick Share targets on the LAN.
     Scan {
@@ -108,7 +133,100 @@ enum QuickshareAction {
     },
 }
 
+fn describe(peer: &dbus::PeerInfo) -> String {
+    let mut parts = Vec::new();
+    if peer.connected {
+        parts.push("connected".to_owned());
+    }
+    if peer.reachable {
+        parts.push("on network".to_owned());
+    }
+    if peer.nearby {
+        parts.push(format!("{} ({:.0} dBm)", peer.proximity, peer.rssi));
+    }
+    if parts.is_empty() {
+        "not seen".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
+async fn page(profile: &str, device: &str, seconds: u32) -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+    let daemon = dbus::connect(profile).await?;
+    let mut found = daemon.receive_page_found().await?;
+    let id = daemon.page(device, seconds).await?;
+    println!("Ringing for up to {seconds} s. Press Ctrl-C to stop.");
+    let outcome = tokio::select! {
+        () = async {
+            while let Some(signal) = found.next().await {
+                if signal.args().is_ok_and(|a| a.id == id) {
+                    return;
+                }
+            }
+        } => "Found it.",
+        () = tokio::time::sleep(Duration::from_secs(seconds.into())) => "Stopped ringing.",
+        _ = tokio::signal::ctrl_c() => {
+            daemon.stop_page(device).await.ok();
+            "Cancelled."
+        }
+    };
+    println!("{outcome}");
+    Ok(())
+}
+
+async fn radar(profile: &str, device: &str) -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+    use std::io::Write as _;
+    let daemon = dbus::connect(profile).await?;
+    let peers = daemon.peers().await?;
+    let needle = device.to_lowercase();
+    let target = peers
+        .iter()
+        .find(|p| p.id.starts_with(&needle))
+        .or_else(|| {
+            peers
+                .iter()
+                .find(|p| p.name.to_lowercase().contains(&needle))
+        })
+        .ok_or_else(|| anyhow::anyhow!("no paired device matches {device:?}"))?
+        .clone();
+    println!("Radar for \"{}\" (Ctrl-C to stop)", target.name);
+    let draw = |peer: &dbus::PeerInfo| {
+        let line = if peer.nearby {
+            // Map roughly -100..-30 dBm onto a 40-cell bar.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let cells = (((peer.rssi + 100.0) / 70.0).clamp(0.0, 1.0) * 40.0).round() as usize;
+            format!(
+                "{:<40}  {:>4.0} dBm  {}",
+                "█".repeat(cells),
+                peer.rssi,
+                peer.proximity
+            )
+        } else {
+            format!("{:<40}  out of Bluetooth range", "")
+        };
+        print!("\r{line:<70}");
+        let _ = std::io::stdout().flush();
+    };
+    draw(&target);
+    let mut changes = daemon.receive_peer_changed().await?;
+    loop {
+        tokio::select! {
+            Some(signal) = changes.next() => {
+                if let Ok(args) = signal.args() && args.peer.id == target.id {
+                    draw(&args.peer);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    println!();
+    Ok(())
+}
+
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // A flat command dispatch.
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -127,14 +245,27 @@ async fn main() -> anyhow::Result<()> {
             println!("Paired:   {} device(s)", ctx.peers.len());
         }
         Command::Peers => {
-            let ctx = Ctx::load(&cli.profile, cli.name).await?;
-            if ctx.peers.is_empty() {
-                println!("No paired devices. Run `continuum pair invite` to pair one.");
-            }
-            for peer in &ctx.peers {
-                println!("{}  {}", short_id(&peer.device_id()), peer.name);
+            if let Ok(daemon) = dbus::connect(&cli.profile).await {
+                let peers = daemon.peers().await?;
+                if peers.is_empty() {
+                    println!("No paired devices. Run `continuum pair invite` to pair one.");
+                }
+                for peer in &peers {
+                    println!("{}  {:<24} {}", &peer.id[..8], peer.name, describe(peer));
+                }
+            } else {
+                let ctx = Ctx::load(&cli.profile, cli.name).await?;
+                if ctx.peers.is_empty() {
+                    println!("No paired devices. Run `continuum pair invite` to pair one.");
+                }
+                for peer in &ctx.peers {
+                    println!("{}  {}", short_id(&peer.device_id()), peer.name);
+                }
+                println!("(daemon not running; start it with `continuum run` for live status)");
             }
         }
+        Command::Page { device, seconds } => page(&cli.profile, &device, seconds).await?,
+        Command::Radar { device } => radar(&cli.profile, &device).await?,
         Command::Pair { action } => {
             let mut ctx = Ctx::load(&cli.profile, cli.name).await?;
             match action {
@@ -164,13 +295,24 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Unpair { device } => {
-            let mut ctx = Ctx::load(&cli.profile, cli.name).await?;
-            let peer = ctx.find_peer(&device)?.clone();
-            ctx.remove_peer(&peer.device_id()).await?;
-            println!("Forgot \"{}\".", peer.name);
-            println!(
-                "Note: it can still recognise this device's beacons until the presence key is rotated (not implemented yet)."
-            );
+            if let Ok(daemon) = dbus::connect(&cli.profile).await {
+                let name = daemon.unpair(&device).await?;
+                println!(
+                    "Unpaired \"{name}\" on both devices and rotated this device's presence key."
+                );
+            } else {
+                let mut ctx = Ctx::load(&cli.profile, cli.name).await?;
+                let peer = ctx.find_peer(&device)?.clone();
+                ctx.remove_peer(&peer.device_id()).await?;
+                println!(
+                    "Forgot \"{}\" and rotated this device's presence key.",
+                    peer.name
+                );
+                println!(
+                    "The daemon isn't running, so \"{}\" wasn't told; unpair it there too.",
+                    peer.name
+                );
+            }
         }
         Command::Run {
             port,
@@ -196,6 +338,10 @@ async fn main() -> anyhow::Result<()> {
                 let ctx = Ctx::load(&cli.profile, cli.name).await?;
                 quickshare::watch(&ctx, Duration::from_secs(seconds), visible).await?;
             }
+        },
+        Command::Service { action } => match action {
+            ServiceAction::Install => service::install().await?,
+            ServiceAction::Uninstall => service::uninstall().await?,
         },
         Command::Reset { yes } => {
             anyhow::ensure!(

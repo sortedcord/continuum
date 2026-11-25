@@ -14,7 +14,11 @@ import android.content.pm.ServiceInfo
 import android.os.IBinder
 import io.github.sortedcord.continuum.ContinuumApp
 import io.github.sortedcord.continuum.R
+import io.github.sortedcord.continuum.BuildConfig
 import io.github.sortedcord.continuum.ffi.AdvertisementFfi
+import io.github.sortedcord.continuum.ffi.NodeEventFfi
+import java.io.File
+import java.net.Inet6Address
 import io.github.sortedcord.continuum.platform.BleAdapter
 import io.github.sortedcord.continuum.platform.NsdAdapter
 import io.github.sortedcord.continuum.ui.MainActivity
@@ -28,6 +32,7 @@ class ContinuumService : Service() {
     private val repository by lazy { (application as ContinuumApp).repository }
     private lateinit var ble: BleAdapter
     private lateinit var nsd: NsdAdapter
+    private lateinit var ringer: PageRinger
     private var serviceType: String? = null
     @Volatile private var lastAdvertisement: AdvertisementFfi? = null
 
@@ -64,16 +69,33 @@ class ContinuumService : Service() {
             repository::log,
             onResolved = { name, txt, host, port ->
                 android.util.Log.d("Continuum", "mDNS resolved $name at ${host.hostAddress}:$port")
-                runCatching { node.observeLan(name, txt, host.hostAddress ?: return@runCatching, port.toUShort()) }
+                val scope = (host as? Inet6Address)?.scopeId ?: 0
+                runCatching {
+                    node.observeLan(name, txt, host.hostAddress ?: return@runCatching, port.toUShort(), scope.toUInt())
+                }
             },
             onLost = { name ->
                 android.util.Log.d("Continuum", "mDNS lost $name")
                 node.withdrawLan(name)
             },
         )
+        ringer = PageRinger(this)
         repository.onAdvertise = ::advertise
+        repository.onPage = { event ->
+            when (event) {
+                is NodeEventFfi.PageStart -> {
+                    repository.log("${event.name} is looking for this phone")
+                    ringer.start(event.peerId, event.name, event.durationS.toInt())
+                }
+                is NodeEventFfi.PageStop -> ringer.stop()
+                else -> {}
+            }
+        }
         registerReceiver(bluetoothState, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
-        runCatching { node.start(repository.listener) }
+        // Debug builds can rotate identifiers every minute for testing:
+        //   adb shell run-as io.github.sortedcord.continuum touch files/fast-rotation
+        val rotation = if (BuildConfig.DEBUG && File(filesDir, "fast-rotation").exists()) 60u else null
+        runCatching { node.start(repository.listener, rotation) }
             .onSuccess { port ->
                 repository.setRunning(true)
                 repository.log("Listening on port $port")
@@ -102,15 +124,24 @@ class ContinuumService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                repository.enabled = false
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_FOUND -> {
+                val peer = ringer.found() ?: intent.getStringExtra(EXTRA_PEER)
+                peer?.let { id -> Thread { runCatching { repository.continuum.pageFound(id) } }.start() }
+            }
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
         repository.onAdvertise = null
+        repository.onPage = null
+        ringer.stop()
         unregisterReceiver(bluetoothState)
         ble.stopScan()
         ble.stopAdvertising()
@@ -146,12 +177,16 @@ class ContinuumService : Service() {
         private const val CHANNEL = "presence"
         private const val NOTIFICATION_ID = 1
         private const val ACTION_STOP = "stop"
+        const val ACTION_FOUND = "found"
+        const val EXTRA_PEER = "peer"
 
         fun start(context: Context) {
+            (context.applicationContext as ContinuumApp).repository.enabled = true
             context.startForegroundService(Intent(context, ContinuumService::class.java))
         }
 
         fun stop(context: Context) {
+            (context.applicationContext as ContinuumApp).repository.enabled = false
             context.stopService(Intent(context, ContinuumService::class.java))
         }
     }

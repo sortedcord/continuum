@@ -9,16 +9,18 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use continuum_core::clock::SystemClock;
 use continuum_core::entropy::OsEntropy;
 use continuum_core::identity::{DeviceId, DeviceIdentity};
 use continuum_core::presence::ProximityBand;
-use continuum_core::proto::v1::{Capability, CapabilityManifest, DeviceInfo, DeviceKind, Hello};
+use continuum_core::proto::v1::{DeviceInfo, DeviceKind};
 use continuum_core::proto::{BLE_SERVICE_UUID, PROTOCOL_VERSION};
 use continuum_core::trust::{TrustedPeer, decode_peers, encode_peers};
+use continuum_node::features::page::{self, PageAction};
 use continuum_node::pairing::{join_invite, join_with_code};
 use continuum_node::{NodeConfig, NodeEvent, NodeHandle, PeerStatus};
 use tokio::runtime::Runtime;
@@ -102,6 +104,7 @@ impl From<&TrustedPeer> for PairedDevice {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+#[allow(clippy::struct_excessive_bools)] // A flat record is simplest for Kotlin.
 pub struct PeerStatusFfi {
     pub id: String,
     pub name: String,
@@ -111,6 +114,8 @@ pub struct PeerStatusFfi {
     pub proximity: Option<ProximityFfi>,
     pub rssi: Option<f32>,
     pub addrs: Vec<String>,
+    /// Whether the peer can be paged right now.
+    pub can_page: bool,
 }
 
 impl From<PeerStatus> for PeerStatusFfi {
@@ -124,6 +129,7 @@ impl From<PeerStatus> for PeerStatusFfi {
             proximity: status.band.map(Into::into),
             rssi: status.rssi,
             addrs: status.addrs.iter().map(ToString::to_string).collect(),
+            can_page: status.capabilities.contains_key(page::CAPABILITY),
         }
     }
 }
@@ -145,11 +151,47 @@ pub struct AdvertisementFfi {
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum NodeEventFfi {
-    Advertise { advertisement: AdvertisementFfi },
-    Peer { status: PeerStatusFfi },
-    SessionUp { peer_id: String, name: String },
-    SessionDown { peer_id: String, reason: String },
-    PairingCandidate { addr: Option<String>, present: bool },
+    Advertise {
+        advertisement: AdvertisementFfi,
+    },
+    Peer {
+        status: PeerStatusFfi,
+    },
+    SessionUp {
+        peer_id: String,
+        name: String,
+    },
+    SessionDown {
+        peer_id: String,
+        reason: String,
+    },
+    PairingCandidate {
+        addr: Option<String>,
+        present: bool,
+    },
+    /// The trust store changed (a peer rotated its key, or unpaired us).
+    /// Persist [`Continuum::trust_store`].
+    TrustChanged,
+    /// A peer unpaired us.
+    Unpaired {
+        peer_id: String,
+        name: String,
+    },
+    /// A peer wants this device to ring, even on silent.
+    PageStart {
+        peer_id: String,
+        name: String,
+        duration_s: u32,
+    },
+    /// The peer cancelled its page.
+    PageStop {
+        peer_id: String,
+    },
+    /// A device we paged was found and silenced.
+    PageFound {
+        peer_id: String,
+        name: String,
+    },
 }
 
 /// Receives node events on a background thread.
@@ -168,16 +210,16 @@ pub trait CodeConfirmer: Send + Sync {
 #[derive(uniffi::Object)]
 pub struct Continuum {
     runtime: Runtime,
-    identity: Arc<DeviceIdentity>,
+    identity: Mutex<Arc<DeviceIdentity>>,
     device: DeviceInfo,
-    peers: Mutex<Vec<TrustedPeer>>,
+    peers: Arc<Mutex<Vec<TrustedPeer>>>,
     node: Mutex<Option<NodeHandle>>,
 }
 
 impl std::fmt::Debug for Continuum {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Continuum")
-            .field("device_id", &self.identity.device_id())
+            .field("device_id", &self.identity().device_id())
             .finish_non_exhaustive()
     }
 }
@@ -194,17 +236,25 @@ impl Continuum {
             .clone()
     }
 
-    fn hello(&self) -> Hello {
-        let capability = |name: &str| Capability {
-            name: name.into(),
-            version: 1,
-        };
-        Hello {
-            device: Some(self.device.clone()),
-            manifest: Some(CapabilityManifest {
-                capabilities: vec![capability("presence"), capability("ping")],
-            }),
-        }
+    fn identity(&self) -> Arc<DeviceIdentity> {
+        self.identity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn find_peer(&self, id: &str) -> Result<DeviceId, ContinuumError> {
+        parse_device_id(id, &self.peers()).ok_or_else(|| invalid("unknown device"))
+    }
+
+    fn send_page(&self, peer_id: &str, action: PageAction) -> Result<(), ContinuumError> {
+        let peer = self.find_peer(peer_id)?;
+        let node = self.node().ok_or(ContinuumError::NotRunning)?;
+        self.runtime
+            .block_on(node.send_feature(peer, page::CAPABILITY, page::encode(action)))
+            .map_err(|err| ContinuumError::Network {
+                detail: err.to_string(),
+            })
     }
 
     fn save_peer(&self, peer: TrustedPeer) -> PairedDevice {
@@ -240,7 +290,18 @@ fn parse_device_id(id: &str, peers: &[TrustedPeer]) -> Option<DeviceId> {
         .find(|d| d.to_string() == id)
 }
 
-fn event_to_ffi(event: NodeEvent) -> Option<NodeEventFfi> {
+fn name_of(peers: &Mutex<Vec<TrustedPeer>>, id: &DeviceId) -> String {
+    peers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|p| &p.device_id() == id)
+        .map(|p| p.name.clone())
+        .unwrap_or_default()
+}
+
+/// Translates a node event, keeping the FFI's copy of the trust store in sync.
+fn event_to_ffi(event: NodeEvent, peers: &Mutex<Vec<TrustedPeer>>) -> Option<NodeEventFfi> {
     Some(match event {
         NodeEvent::Advertise(ad) => NodeEventFfi::Advertise {
             advertisement: AdvertisementFfi {
@@ -260,7 +321,7 @@ fn event_to_ffi(event: NodeEvent) -> Option<NodeEventFfi> {
         NodeEvent::Peer(status) => NodeEventFfi::Peer {
             status: status.into(),
         },
-        NodeEvent::SessionUp { peer, hello } => NodeEventFfi::SessionUp {
+        NodeEvent::SessionUp { peer, hello, .. } => NodeEventFfi::SessionUp {
             peer_id: peer.to_string(),
             name: hello.device.map(|d| d.name).unwrap_or_default(),
         },
@@ -272,7 +333,48 @@ fn event_to_ffi(event: NodeEvent) -> Option<NodeEventFfi> {
             addr: addr.map(|a| a.to_string()),
             present,
         },
-        NodeEvent::Presence(_) | NodeEvent::Message { .. } => return None,
+        NodeEvent::PeerUpdated(updated) => {
+            let mut peers = peers.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(stored) = peers
+                .iter_mut()
+                .find(|p| p.device_id() == updated.device_id())
+            {
+                *stored = updated;
+            }
+            NodeEventFfi::TrustChanged
+        }
+        NodeEvent::Unpaired { peer } => {
+            let name = name_of(peers, &peer);
+            peers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|p| p.device_id() != peer);
+            NodeEventFfi::Unpaired {
+                peer_id: peer.to_string(),
+                name,
+            }
+        }
+        NodeEvent::Feature {
+            peer,
+            capability,
+            body,
+            ..
+        } if capability == page::CAPABILITY => {
+            let peer_id = peer.to_string();
+            match page::decode(&body)? {
+                PageAction::Start { duration_s } => NodeEventFfi::PageStart {
+                    name: name_of(peers, &peer),
+                    peer_id,
+                    duration_s,
+                },
+                PageAction::Stop => NodeEventFfi::PageStop { peer_id },
+                PageAction::Found => NodeEventFfi::PageFound {
+                    name: name_of(peers, &peer),
+                    peer_id,
+                },
+            }
+        }
+        NodeEvent::Presence(_) | NodeEvent::Feature { .. } => return None,
     })
 }
 
@@ -307,19 +409,21 @@ impl Continuum {
             .map_err(invalid)?;
         Ok(Arc::new(Self {
             runtime,
-            identity: Arc::new(identity),
+            identity: Mutex::new(Arc::new(identity)),
             device: DeviceInfo {
                 name: continuum_core::pairing::sanitize_name(&name),
                 kind: DeviceKind::from(kind).into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            peers: Mutex::new(peers),
+            peers: Arc::new(Mutex::new(peers)),
             node: Mutex::new(None),
         }))
     }
 
+    /// Serialised identity (secret). Save again after [`Self::unpair`],
+    /// which rotates the presence key.
     pub fn identity_secret(&self) -> Vec<u8> {
-        self.identity.to_secret_bytes().to_vec()
+        self.identity().to_secret_bytes().to_vec()
     }
 
     /// Serialised trust store (contains secrets). Save after pairing changes.
@@ -328,7 +432,7 @@ impl Continuum {
     }
 
     pub fn device_id(&self) -> String {
-        self.identity.device_id().to_string()
+        self.identity().device_id().to_string()
     }
 
     pub fn paired_devices(&self) -> Vec<PairedDevice> {
@@ -336,15 +440,25 @@ impl Continuum {
     }
 
     /// Starts the node and returns the TCP port it listens on. Events go to
-    /// `listener`; the first is always `Advertise`.
+    /// `listener`; the first is always `Advertise`. `rotation_secs`
+    /// overrides the identifier rotation interval (for testing).
     ///
     /// # Errors
     /// Fails if the listener cannot be bound.
-    pub fn start(&self, listener: Arc<dyn NodeListener>) -> Result<u16, ContinuumError> {
+    pub fn start(
+        &self,
+        listener: Arc<dyn NodeListener>,
+        rotation_secs: Option<u32>,
+    ) -> Result<u16, ContinuumError> {
         if let Some(node) = self.node() {
             return Ok(node.port());
         }
-        let config = NodeConfig::new(self.identity.clone(), self.peers().clone(), self.hello());
+        let mut config =
+            NodeConfig::new(self.identity(), self.peers().clone(), self.device.clone());
+        config.capabilities = vec![page::capability_v1()];
+        if let Some(secs) = rotation_secs {
+            config.rotation = Duration::from_secs(u64::from(secs.max(10)));
+        }
         let (node, mut events) = self
             .runtime
             .block_on(continuum_node::start(config))
@@ -352,9 +466,10 @@ impl Continuum {
                 detail: err.to_string(),
             })?;
         let port = node.port();
+        let peers = self.peers.clone();
         self.runtime.spawn(async move {
             while let Some(event) = events.recv().await {
-                if let Some(event) = event_to_ffi(event) {
+                if let Some(event) = event_to_ffi(event, &peers) {
                     let listener = listener.clone();
                     // Foreign callbacks may block; keep them off the reactor.
                     let _ = tokio::task::spawn_blocking(move || listener.on_event(event)).await;
@@ -395,15 +510,26 @@ impl Continuum {
     ///
     /// # Errors
     /// Fails if `host` is not an IP address.
+    ///
+    /// `host` may carry a `%zone` suffix; pass the interface index as
+    /// `scope_id` (0 if none) so link-local IPv6 addresses stay usable.
     pub fn observe_lan(
         &self,
         name: String,
         txt: HashMap<String, String>,
         host: String,
         port: u16,
+        scope_id: u32,
     ) -> Result<(), ContinuumError> {
-        let ip: IpAddr = host.trim_start_matches('/').parse().map_err(invalid)?;
-        let addr = SocketAddr::new(ip, port);
+        let host = host.trim_start_matches('/');
+        let host = host.split_once('%').map_or(host, |(ip, _)| ip);
+        let ip: IpAddr = host.parse().map_err(invalid)?;
+        let addr = match ip {
+            IpAddr::V6(v6) if scope_id != 0 => {
+                SocketAddr::V6(SocketAddrV6::new(v6, port, 0, scope_id))
+            }
+            _ => SocketAddr::new(ip, port),
+        };
         let txt: Vec<(String, String)> = txt.into_iter().collect();
         self.spawn_on_node(move |node| async move { node.observe_lan(name, txt, addr).await });
         Ok(())
@@ -427,7 +553,7 @@ impl Continuum {
         let peer = self
             .runtime
             .block_on(join_invite(
-                &self.identity,
+                &self.identity(),
                 self.device.clone(),
                 &invite,
                 &SystemClock,
@@ -457,7 +583,7 @@ impl Continuum {
         let peer = self
             .runtime
             .block_on(join_with_code(
-                &self.identity,
+                &self.identity(),
                 self.device.clone(),
                 &[addr],
                 confirm,
@@ -469,19 +595,48 @@ impl Continuum {
         Ok(self.save_peer(peer))
     }
 
-    /// Forgets a paired device.
+    /// Forgets a paired device and tells it to forget us, then rotates our
+    /// presence key so it can no longer recognise our beacons. Persist both
+    /// [`Self::identity_secret`] and [`Self::trust_store`] afterwards.
     ///
     /// # Errors
     /// Fails if no paired device has that id.
     pub fn unpair(&self, id: String) -> Result<(), ContinuumError> {
-        let snapshot = {
-            let mut peers = self.peers();
-            let device = parse_device_id(&id, &peers).ok_or_else(|| invalid("unknown device"))?;
-            peers.retain(|p| p.device_id() != device);
-            peers.clone()
-        };
-        self.spawn_on_node(move |node| async move { node.set_peers(snapshot).await });
+        let peer = self.find_peer(&id)?;
+        self.peers().retain(|p| p.device_id() != peer);
+        let rotated = Arc::new(self.identity().with_new_presence_key(&mut OsEntropy));
+        *self.identity.lock().unwrap_or_else(PoisonError::into_inner) = rotated.clone();
+        if let Some(node) = self.node() {
+            self.runtime.block_on(async {
+                let _ = node.unpair(peer).await;
+                let _ = node.set_identity(rotated).await;
+            });
+        }
         Ok(())
+    }
+
+    /// Makes a connected peer ring, even on silent.
+    ///
+    /// # Errors
+    /// Fails if the peer is unknown, not connected, or can't be paged.
+    pub fn page(&self, peer_id: String, duration_s: u32) -> Result<(), ContinuumError> {
+        self.send_page(&peer_id, PageAction::Start { duration_s })
+    }
+
+    /// Cancels a page we started.
+    ///
+    /// # Errors
+    /// Fails if the peer is unknown or not connected.
+    pub fn stop_page(&self, peer_id: String) -> Result<(), ContinuumError> {
+        self.send_page(&peer_id, PageAction::Stop)
+    }
+
+    /// Tells the pager that the user found this device.
+    ///
+    /// # Errors
+    /// Fails if the peer is unknown or not connected.
+    pub fn page_found(&self, peer_id: String) -> Result<(), ContinuumError> {
+        self.send_page(&peer_id, PageAction::Found)
     }
 }
 
@@ -522,7 +677,7 @@ mod tests {
     fn start_emits_advertisement() {
         let device = Continuum::new(None, None, "Pixel".into(), DeviceKindFfi::Phone).unwrap();
         let listener = Arc::new(Collect(Mutex::new(Vec::new())));
-        let port = device.start(listener.clone()).unwrap();
+        let port = device.start(listener.clone(), None).unwrap();
         assert_ne!(port, 0);
         std::thread::sleep(std::time::Duration::from_millis(300));
         let events = listener.0.lock().unwrap().clone();

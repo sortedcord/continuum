@@ -19,6 +19,21 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/continuum.v1.rs"));
 }
 
+/// Protobuf messages for optional features, by capability and version.
+#[allow(clippy::pedantic, missing_debug_implementations)]
+pub mod features {
+    pub mod page {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/continuum.features.page.v1.rs"));
+        }
+    }
+    pub mod trust {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/continuum.features.trust.v1.rs"));
+        }
+    }
+}
+
 /// Current Continuum protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 

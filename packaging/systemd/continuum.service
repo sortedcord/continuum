@@ -1,0 +1,15 @@
+[Unit]
+Description=Continuum presence daemon
+Documentation=https://github.com/sortedcord/continuum
+# Needs the session bus (D-Bus API), the Secret Service, Avahi and BlueZ.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@CONTINUUM@ run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

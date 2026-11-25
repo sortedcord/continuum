@@ -496,11 +496,14 @@ dependencies = [
  "continuum-net",
  "continuum-node",
  "continuum-quickshare",
+ "futures",
  "if-addrs",
  "qrcode",
+ "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]
@@ -549,6 +552,7 @@ version = "0.1.0"
 dependencies = [
  "continuum-core",
  "continuum-net",
+ "prost",
  "thiserror",
  "tokio",
  "tracing",

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 continuum-core.workspace = true
 continuum-net.workspace = true
+prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

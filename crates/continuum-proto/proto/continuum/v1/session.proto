@@ -23,9 +23,14 @@ message DeviceInfo {
 }
 
 // A versioned service the device offers, e.g. {"clipboard", 1}.
+// The device speaks every version from min_version to version; both sides
+// use the highest version they have in common.
 message Capability {
   string name = 1;
+  // Highest supported version.
   uint32 version = 2;
+  // Lowest supported version; 0 means the same as `version`.
+  uint32 min_version = 3;
 }
 
 message CapabilityManifest {
@@ -36,6 +41,18 @@ message CapabilityManifest {
 message Hello {
   DeviceInfo device = 1;
   CapabilityManifest manifest = 2;
+  // The sender's current presence key (32 bytes). Lets peers pick up a
+  // rotated key, e.g. after the sender unpaired another device.
+  bytes presence_key = 3;
+}
+
+// A message for a feature negotiated through the capability manifests.
+// Each feature defines its own body schema (see proto/continuum/features).
+message FeatureMessage {
+  string capability = 1;
+  // Negotiated version the body is encoded with.
+  uint32 version = 2;
+  bytes body = 3;
 }
 
 message Ping {
@@ -63,5 +80,6 @@ message Envelope {
     Ping ping = 2;
     Pong pong = 3;
     Goodbye goodbye = 4;
+    FeatureMessage feature = 5;
   }
 }

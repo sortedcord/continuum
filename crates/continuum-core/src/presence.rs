@@ -302,6 +302,11 @@ impl PresenceRegistry {
         self.candidates.values()
     }
 
+    /// The trusted peer an identifier belongs to, if any (cached).
+    pub fn resolve_peer(&mut self, id: &ResolvableId) -> Option<DeviceId> {
+        self.resolve(id)
+    }
+
     fn resolve(&mut self, id: &ResolvableId) -> Option<DeviceId> {
         if let Some(peer) = self.resolved.get(id) {
             return Some(*peer);
@@ -529,7 +534,6 @@ fn lost_events(peer: DeviceId, presence: &PeerPresence, events: &mut Vec<Presenc
 }
 
 #[cfg(test)]
-#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use crate::entropy::DeterministicEntropy;

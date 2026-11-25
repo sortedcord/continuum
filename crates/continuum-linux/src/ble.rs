@@ -5,7 +5,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use std::time::Duration;
+
 use bluer::adv::{Advertisement, AdvertisementHandle, Type};
+use bluer::monitor::{Monitor, MonitorHandle, Pattern, RssiSamplingPeriod};
 use bluer::{
     Adapter, AdapterEvent, Address, DeviceEvent, DeviceProperty, DiscoveryFilter,
     DiscoveryTransport, Session, Uuid,
@@ -78,6 +81,10 @@ impl Ble {
             advertisement_type: Type::Broadcast,
             service_data: BTreeMap::from([(uuid, data)]),
             discoverable: Some(false),
+            // BlueZ defaults to 1.28 s, too slow for a responsive radar.
+            // 200-300 ms matches Android's "balanced" mode.
+            min_interval: Some(Duration::from_millis(200)),
+            max_interval: Some(Duration::from_millis(300)),
             ..Default::default()
         };
         Ok(self.adapter.advertise(advertisement).await?)
@@ -92,13 +99,18 @@ impl Ble {
         // No UUID filter: the kernel only matches UUIDs in the advertised
         // service-UUID lists, not service-data UUIDs, which is all our
         // beacons carry. Filtering happens in `watch_device` instead.
+        //
+        // An RSSI filter, even one that admits everything, makes BlueZ report
+        // every RSSI change instead of only changes of 8 dB or more.
         self.adapter
             .set_discovery_filter(DiscoveryFilter {
                 transport: DiscoveryTransport::Le,
                 duplicate_data: true,
+                rssi: Some(-127),
                 ..Default::default()
             })
             .await?;
+        let monitor = self.monitor(&uuids).await;
         let (tx, rx) = mpsc::channel(256);
         let adapter = self.adapter.clone();
         let task = tokio::spawn(async move {
@@ -106,7 +118,54 @@ impl Ble {
                 tracing::warn!(%err, "BLE scan stopped");
             }
         });
-        Ok(Scanner { rx, task })
+        Ok(Scanner {
+            rx,
+            task,
+            _monitor: monitor,
+        })
+    }
+
+    /// Registers a BlueZ advertisement monitor for our service data. This
+    /// turns off the controller's duplicate filtering, so every beacon is
+    /// reported instead of roughly one per scan window. Needs bluetoothd
+    /// with `Experimental = true`; without it we fall back to plain scanning.
+    async fn monitor(&self, uuids: &HashSet<Uuid>) -> Option<MonitorHandle> {
+        let patterns: Vec<Pattern> = uuids.iter().map(service_data_pattern).collect();
+        let manager = match self.adapter.monitor().await {
+            Ok(manager) => manager,
+            Err(err) => {
+                tracing::info!(%err, "BlueZ advertisement monitors unavailable; RSSI updates will be sparse");
+                return None;
+            }
+        };
+        let monitor = Monitor {
+            patterns: Some(patterns),
+            rssi_sampling_period: Some(RssiSamplingPeriod::All),
+            ..Default::default()
+        };
+        match manager.register(monitor).await {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::info!(%err, "could not register advertisement monitor");
+                None
+            }
+        }
+    }
+}
+
+/// Matches the service-data AD structure for `uuid` (UUIDs are little-endian
+/// on air; 16-bit UUIDs use the short form).
+fn service_data_pattern(uuid: &Uuid) -> Pattern {
+    let value = uuid.as_u128();
+    let base = 0x0000_0000_0000_1000_8000_0080_5f9b_34fb_u128;
+    if value & !(0xffff_u128 << 96) == base {
+        #[allow(clippy::cast_possible_truncation)]
+        let short = (value >> 96) as u16;
+        Pattern::new(0x16, 0, &short.to_le_bytes())
+    } else {
+        let mut bytes = uuid.as_bytes().to_vec();
+        bytes.reverse();
+        Pattern::new(0x21, 0, &bytes)
     }
 }
 
@@ -196,6 +255,7 @@ async fn watch_device(
 pub struct Scanner {
     rx: mpsc::Receiver<ServiceDataSeen>,
     task: JoinHandle<()>,
+    _monitor: Option<MonitorHandle>,
 }
 
 impl Scanner {
@@ -213,6 +273,20 @@ impl Drop for Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patterns_use_on_air_byte_order() {
+        let short = service_data_pattern(&uuid16(0xFE2C));
+        assert_eq!(
+            (short.data_type, short.content.as_slice()),
+            (0x16, [0x2C, 0xFE].as_slice())
+        );
+        let long: Uuid = "9b4354e1-15ec-4324-9f00-e9c5549237f7".parse().unwrap();
+        let long = service_data_pattern(&long);
+        assert_eq!(long.data_type, 0x21);
+        assert_eq!(long.content[0], 0xf7);
+        assert_eq!(long.content[15], 0x9b);
+    }
 
     #[test]
     fn expands_16_bit_uuids() {

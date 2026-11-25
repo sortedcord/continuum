@@ -160,6 +160,17 @@ impl DeviceIdentity {
         self.presence = PresenceKey::generate(entropy);
     }
 
+    /// A copy of this identity with a fresh presence key. The signing and
+    /// agreement keys, and therefore the [`DeviceId`], stay the same.
+    #[must_use]
+    pub fn with_new_presence_key(&self, entropy: &mut impl Entropy) -> Self {
+        Self {
+            signing: self.signing.clone(),
+            agreement: self.agreement.clone(),
+            presence: PresenceKey::generate(entropy),
+        }
+    }
+
     pub fn sign(&self, message: &[u8]) -> Signature {
         self.signing.sign(message)
     }
@@ -232,6 +243,15 @@ mod tests {
         let ab = alice.agree(&bob.public().agreement);
         let ba = bob.agree(&alice.public().agreement);
         assert_eq!(*ab, *ba);
+    }
+
+    #[test]
+    fn new_presence_key_keeps_identity() {
+        let original = identity(9);
+        let rotated = original.with_new_presence_key(&mut DeterministicEntropy::new(10));
+        assert_eq!(rotated.device_id(), original.device_id());
+        assert_eq!(rotated.public(), original.public());
+        assert_ne!(rotated.presence_key(), original.presence_key());
     }
 
     #[test]

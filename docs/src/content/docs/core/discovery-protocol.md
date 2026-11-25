@@ -92,9 +92,43 @@ The prologue is `continuum/v1`. The Noise static key is the device's X25519 agre
 
 ### Sessions
 
-The initiator already knows the responder's static key from the trust store (`IK`, one round trip). The responder looks up the initiator's static key after the first message and drops unknown initiators **before replying**, so strangers learn nothing. Both sides then exchange `Hello` (device info plus capability manifest) inside an `Envelope`.
+The initiator already knows the responder's static key from the trust store (`IK`, one round trip). The responder looks up the initiator's static key after the first message and drops unknown initiators **before replying**, so strangers learn nothing. Both sides then exchange `Hello` inside an `Envelope`. It carries the device info, the capability manifest, and the sender's current presence key (so peers pick up a rotated key automatically).
 
-The session sends a `Ping` every 10 s and closes after 3 silent intervals. If both devices connect at once, both keep the session initiated by the lower `DeviceId`. The higher-id device waits 10 s before connecting itself.
+The session sends a `Ping` every 10 s and closes after 3 silent intervals.
+
+### Capabilities and features
+
+Each side lists capabilities as `(name, min_version..=version)`. A feature is usable on a session when both sides list it and the ranges overlap; the highest shared version wins, and unknown features are ignored. Feature traffic travels as `FeatureMessage { capability, version, body }`, with each feature defining its own Protobuf body under `proto/continuum/features/`. Messages for features that weren't negotiated are dropped.
+
+| Capability | Purpose |
+| --- | --- |
+| `presence.v1` | Built in |
+| `trust.v1` | Built in: `PresenceKey` update after a key rotation |
+| `page.v1` | Find My Device: `Start { duration_s }` (max 120 s), `Stop`, `Found` |
+
+### Unpairing
+
+Unpairing is mutual and rotates the unpairing device's presence key:
+
+1. If the peer is connected, send `Goodbye { reason: UNPAIRED }`. On receiving it, the peer removes us from its trust store.
+2. Generate a new presence key (the signing and agreement keys, and so the `DeviceId`, stay the same) and persist it.
+3. Send `trust.v1 PresenceKey` to every connected peer. Offline peers get the new key from the next session's `Hello`. They can't resolve our new beacons until then, but we can still resolve theirs, so we connect to them.
+
+The removed device can no longer link our new identifiers to us. If both devices connect at once, both keep the session initiated by the lower `DeviceId`. The higher-id device waits 10 s before connecting itself.
+
+## Linux D-Bus API
+
+The daemon owns `dev.continuum.Daemon` on the session bus (`dev.continuum.Daemon.p_<profile>` for other profiles), object `/dev/continuum/Daemon`, interface `dev.continuum.Daemon1`:
+
+| Member | Kind | Notes |
+| --- | --- | --- |
+| `DeviceId`, `Name` | properties | |
+| `Peers() → a(ssbbbsdb)` | method | id, name, connected, reachable, nearby, proximity, rssi, can_page |
+| `Page(device s, seconds u) → s` | method | `device` is an id prefix or name; returns the peer id |
+| `StopPage(device s)` | method | |
+| `Unpair(device s) → s` | method | Mutual unpair plus key rotation; returns the name |
+| `PeerChanged(peer)` | signal | On presence changes, and RSSI changes (≤ 2/s) for radars |
+| `PageFound(id s, name s)` | signal | A paged device was found |
 
 ## Storage
 
@@ -105,6 +139,7 @@ On Linux, the identity secrets (96 bytes) and the trust store (`StoredTrust` pro
 - Merges BLE and LAN sightings per peer.
 - Smooths RSSI with an exponential moving average (α = 0.3) and maps it to `Immediate` / `Near` / `Far` bands. Each band has separate enter and exit thresholds, so a signal at the boundary doesn't flap.
 - BLE presence expires after 30 s without a beacon. LAN presence has no TTL by default, because Avahi and NsdManager report a service once and then report its removal (they handle cache expiry themselves). It ends only once *every* live identifier for that peer has been withdrawn, so rotation doesn't cause flapping.
+- On Linux, BLE scanning uses an RSSI filter (even an all-admitting one), which makes BlueZ report every RSSI change instead of only changes of 8 dB or more. When bluetoothd runs with `Experimental = true`, an advertisement monitor is also registered to disable duplicate filtering. On the RTL8922AU used during development, the controller still delivers only about one beacon every 3 s while Wi-Fi is busy, so the radar there is coarse.
 - On Linux, BLE scanning runs without a BlueZ UUID filter. The kernel only matches service-UUID lists, and our beacons carry only service data, so matching happens in userspace.
 
 ## Quick Share compatibility

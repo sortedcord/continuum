@@ -56,6 +56,10 @@ class BleAdapter(
             .addServiceData(ParcelUuid.fromString(uuid), serviceData)
             .build()
         val callback = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                android.util.Log.d("Continuum", "BLE beacon advertising")
+            }
+
             override fun onStartFailure(errorCode: Int) {
                 log("BLE advertising failed (error $errorCode)")
             }

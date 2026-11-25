@@ -210,6 +210,7 @@ mod tests {
                 ..Default::default()
             }),
             manifest: None,
+            presence_key: Vec::new(),
         }
     }
 

@@ -45,6 +45,7 @@ fun HomeScreen(repository: NodeRepository, onPair: () -> Unit, onToggle: (Boolea
     val statuses by repository.statuses.collectAsState()
     val running by repository.running.collectAsState()
     val log by repository.log.collectAsState()
+    val paging by repository.paging.collectAsState()
     var forgetting by remember { mutableStateOf<PairedDevice?>(null) }
     val scope = rememberCoroutineScope()
 
@@ -84,7 +85,21 @@ fun HomeScreen(repository: NodeRepository, onPair: () -> Unit, onToggle: (Boolea
                 }
             }
             items(paired, key = { it.id }) { device ->
-                DeviceCard(device, statuses[device.id], onForget = { forgetting = device })
+                DeviceCard(
+                    device,
+                    statuses[device.id],
+                    ringing = device.id in paging,
+                    onRing = { ring ->
+                        scope.launch {
+                            if (ring) {
+                                repository.page(device.id).onFailure { repository.log("Couldn't ring: ${it.message}") }
+                            } else {
+                                repository.stopPage(device.id)
+                            }
+                        }
+                    },
+                    onForget = { forgetting = device },
+                )
             }
             if (log.isNotEmpty()) {
                 item {
@@ -100,7 +115,7 @@ fun HomeScreen(repository: NodeRepository, onPair: () -> Unit, onToggle: (Boolea
         AlertDialog(
             onDismissRequest = { forgetting = null },
             title = { Text("Forget ${device.name}?") },
-            text = { Text("You will need to pair again to reconnect.") },
+            text = { Text("${device.name} will forget this phone too. You will need to pair again to reconnect.") },
             confirmButton = {
                 TextButton(onClick = {
                     scope.launch { repository.unpair(device.id) }
@@ -113,13 +128,22 @@ fun HomeScreen(repository: NodeRepository, onPair: () -> Unit, onToggle: (Boolea
 }
 
 @Composable
-private fun DeviceCard(device: PairedDevice, status: PeerStatusFfi?, onForget: () -> Unit) {
+private fun DeviceCard(
+    device: PairedDevice,
+    status: PeerStatusFfi?,
+    ringing: Boolean,
+    onRing: (Boolean) -> Unit,
+    onForget: () -> Unit,
+) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(device.name, style = MaterialTheme.typography.titleMedium)
                     Text(device.shortId, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+                }
+                if (status?.canPage == true || ringing) {
+                    TextButton(onClick = { onRing(!ringing) }) { Text(if (ringing) "Stop" else "Ring") }
                 }
                 TextButton(onClick = onForget) { Text("Forget") }
             }
