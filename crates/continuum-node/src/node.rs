@@ -331,6 +331,9 @@ enum Internal {
     },
 }
 
+/// TXT entries and addresses of one resolved DNS-SD service.
+type LanRecord = (Vec<(String, String)>, HashSet<SocketAddr>);
+
 struct Live {
     sender: mpsc::Sender<envelope::Body>,
     initiated: bool,
@@ -355,6 +358,10 @@ struct Node {
     reachable_since: HashMap<DeviceId, Timestamp>,
     /// Last RSSI reported per peer, for throttling radar updates.
     last_rssi: HashMap<DeviceId, (Timestamp, f32)>,
+    /// Every live LAN record, trusted or not, so a record seen before its
+    /// owner was paired is picked up as soon as the trust store changes
+    /// (mDNS stacks only report a record once).
+    lan_records: HashMap<String, LanRecord>,
     events: mpsc::Sender<NodeEvent>,
     internal_tx: mpsc::Sender<Internal>,
     internal_rx: Option<mpsc::Receiver<Internal>>,
@@ -392,6 +399,7 @@ impl Node {
             last_attempt: HashMap::new(),
             reachable_since: HashMap::new(),
             last_rssi: HashMap::new(),
+            lan_records: HashMap::new(),
             events,
             internal_tx,
             internal_rx: Some(internal_rx),
@@ -481,6 +489,21 @@ impl Node {
         changed.dedup();
         for peer in changed {
             self.emit_status(&peer).await;
+        }
+    }
+
+    /// Re-checks every known LAN record against the current trust store.
+    async fn replay_lan_records(&mut self, now: Timestamp) {
+        let observations: Vec<_> = self
+            .lan_records
+            .iter()
+            .flat_map(|(name, (txt, addrs))| {
+                addrs.iter().filter_map(move |addr| lan_observation(name, txt, *addr, now))
+            })
+            .collect();
+        for obs in observations {
+            let events = self.registry.ingest(&obs);
+            self.handle_presence(events).await;
         }
     }
 
@@ -672,11 +695,19 @@ impl Node {
         match command {
             Command::Lan { name, txt, addr } => {
                 if let Some(obs) = lan_observation(&name, &txt, addr, now) {
+                    const MAX_RECORDS: usize = 256;
+                    if self.lan_records.len() >= MAX_RECORDS && !self.lan_records.contains_key(&name) {
+                        self.lan_records.clear();
+                    }
+                    let entry = self.lan_records.entry(name).or_default();
+                    entry.0 = txt;
+                    entry.1.insert(addr);
                     let events = self.registry.ingest(&obs);
                     self.handle_presence(events).await;
                 }
             }
             Command::LanRemoved { name } => {
+                self.lan_records.remove(&name);
                 if let Some(id) = continuum_id(&name) {
                     let events = self.registry.withdraw(Transport::Lan, &id);
                     self.handle_presence(events).await;
@@ -699,6 +730,7 @@ impl Node {
                 self.sessions.retain(|id, _| trusted.contains(id));
                 let events = self.registry.set_trusted_peers(&self.peers);
                 self.handle_presence(events).await;
+                self.replay_lan_records(now).await;
             }
             Command::Unpair { peer, reply } => {
                 if !self.peers.iter().any(|p| p.device_id() == peer) {
@@ -1142,6 +1174,24 @@ mod tests {
 
         let err = p.a.unpair(p.phone.device_id()).await.unwrap_err();
         assert!(matches!(err, NodeError::UnknownPeer));
+    }
+
+    #[tokio::test]
+    async fn records_seen_before_pairing_are_picked_up() {
+        let (laptop, phone) = (identity(1), identity(2));
+        let mut cfg = config(&laptop, &phone, "Laptop", "Phone");
+        cfg.peers.clear();
+        let (a, mut a_events) = start(cfg).await.unwrap();
+        advert(&mut a_events).await;
+        let id = phone.presence_key().generate_id(&mut DeterministicEntropy::new(5));
+        let record = continuum_record(id, 4000, BeaconFlags::LAN);
+        a.observe_lan(record.name, record.txt, "127.0.0.1:4000".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(a.snapshot().await.unwrap().is_empty());
+
+        a.set_peers(vec![trusted(&phone, "Phone")]).await.unwrap();
+        assert!(a.snapshot().await.unwrap()[0].reachable);
     }
 
     #[tokio::test]
