@@ -1,0 +1,23 @@
+[package]
+name = "continuum-ffi"
+description = "UniFFI bindings for the Continuum node (used by the Android app)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "continuum_ffi"
+
+[dependencies]
+continuum-core.workspace = true
+continuum-node.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
+uniffi = "0.32"
+
+[lints]
+workspace = true

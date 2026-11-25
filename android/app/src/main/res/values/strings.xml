@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Continuum</string>
+    <string name="channel_presence">Presence</string>
+    <string name="notification_running">Looking for your devices</string>
+</resources>

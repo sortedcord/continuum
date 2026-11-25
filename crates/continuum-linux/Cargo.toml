@@ -25,4 +25,4 @@ workspace = true
 
 [dev-dependencies]
 bluer = { version = "0.17", features = ["bluetoothd"] }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }

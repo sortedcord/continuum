@@ -106,7 +106,49 @@ The project progresses through six modular checkpoints:
 
 ---
 
-## 6. Documentation Site
+## 6. Building & Running (Checkpoint 1 preview)
+
+### Layout
+
+| Path | What it is |
+| :--- | :--- |
+| `crates/continuum-proto` | Versioned wire formats (BLE beacon, Protobuf messages) |
+| `crates/continuum-core` | Portable, I/O-free core: identity, rotating ids, presence registry, Noise handshakes, pairing |
+| `crates/continuum-net` | Async framing, pairing and encrypted sessions over any byte stream |
+| `crates/continuum-node` | Portable node: rotation, presence and session management |
+| `crates/continuum-quickshare` | Quick Share discovery compatibility |
+| `crates/continuum-linux` | Linux adapters: Avahi (mDNS), BlueZ (BLE), Secret Service (keys) |
+| `crates/continuum-daemon` | The `continuum` CLI and daemon |
+| `crates/continuum-ffi` | UniFFI bindings used by the Android app |
+| `android/` | Android app (Kotlin, Jetpack Compose, minSdk 31) |
+
+### Linux
+
+Needs Rust 1.89+, `protoc`, and running `avahi-daemon`, `bluetoothd` and a Secret Service provider (GNOME Keyring, KWallet).
+
+```bash
+cargo build --release -p continuum-daemon
+./target/release/continuum pair invite   # show a QR code to pair a phone
+./target/release/continuum run           # presence daemon
+./target/release/continuum peers
+```
+
+Two Linux machines can pair with `continuum pair join '<invite>'` or `continuum pair scan` (code comparison).
+
+### Android
+
+Needs the Android SDK (`ANDROID_HOME`), NDK 29, `cargo-ndk`, and the Rust targets `aarch64-linux-android` and `x86_64-linux-android`. Gradle builds the Rust library and generates the Kotlin bindings automatically:
+
+```bash
+cd android
+./gradlew installDebug
+```
+
+In the app, tap **Pair device** and scan the QR code from `continuum pair invite`.
+
+---
+
+## 7. Documentation Site
 
 The full documentation is built with [Starlight](https://starlight.astro.build/) and [Astro](https://astro.build/).
 
@@ -139,6 +181,6 @@ The production output will be generated in `docs/dist/`.
 
 ---
 
-## 7. License
+## 8. License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.

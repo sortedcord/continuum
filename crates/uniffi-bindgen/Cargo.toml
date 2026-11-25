@@ -1,0 +1,10 @@
+[package]
+name = "uniffi-bindgen"
+description = "Generates Kotlin bindings for continuum-ffi"
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }
