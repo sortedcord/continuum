@@ -89,9 +89,11 @@ impl Ble {
     /// # Errors
     /// Fails if discovery cannot start.
     pub async fn scan(&self, uuids: HashSet<Uuid>) -> Result<Scanner, BleError> {
+        // No UUID filter: the kernel only matches UUIDs in the advertised
+        // service-UUID lists, not service-data UUIDs, which is all our
+        // beacons carry. Filtering happens in `watch_device` instead.
         self.adapter
             .set_discovery_filter(DiscoveryFilter {
-                uuids: uuids.clone(),
                 transport: DiscoveryTransport::Le,
                 duplicate_data: true,
                 ..Default::default()

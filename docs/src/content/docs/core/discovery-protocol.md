@@ -104,7 +104,8 @@ On Linux, the identity secrets (96 bytes) and the trust store (`StoredTrust` pro
 
 - Merges BLE and LAN sightings per peer.
 - Smooths RSSI with an exponential moving average (α = 0.3) and maps it to `Immediate` / `Near` / `Far` bands. Each band has separate enter and exit thresholds, so a signal at the boundary doesn't flap.
-- TTLs are 30 s for BLE and 150 s for LAN. LAN presence also ends on an mDNS goodbye, but only once *every* live identifier for that peer has been withdrawn, so rotation does not cause flapping.
+- BLE presence expires after 30 s without a beacon. LAN presence has no TTL by default, because Avahi and NsdManager report a service once and then report its removal (they handle cache expiry themselves). It ends only once *every* live identifier for that peer has been withdrawn, so rotation doesn't cause flapping.
+- On Linux, BLE scanning runs without a BlueZ UUID filter. The kernel only matches service-UUID lists, and our beacons carry only service data, so matching happens in userspace.
 
 ## Quick Share compatibility
 

@@ -5,8 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import io.github.sortedcord.continuum.ContinuumApp
@@ -26,6 +29,24 @@ class ContinuumService : Service() {
     private lateinit var ble: BleAdapter
     private lateinit var nsd: NsdAdapter
     private var serviceType: String? = null
+    @Volatile private var lastAdvertisement: AdvertisementFfi? = null
+
+    /** Starts or stops BLE when the user toggles Bluetooth. */
+    private val bluetoothState = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_ON -> lastAdvertisement?.let {
+                    repository.log("Bluetooth on")
+                    startBle(it)
+                }
+                BluetoothAdapter.STATE_TURNING_OFF -> {
+                    ble.stopScan()
+                    ble.stopAdvertising()
+                    repository.log("Bluetooth off; using Wi-Fi only")
+                }
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -42,11 +63,16 @@ class ContinuumService : Service() {
             this,
             repository::log,
             onResolved = { name, txt, host, port ->
+                android.util.Log.d("Continuum", "mDNS resolved $name at ${host.hostAddress}:$port")
                 runCatching { node.observeLan(name, txt, host.hostAddress ?: return@runCatching, port.toUShort()) }
             },
-            onLost = { name -> node.withdrawLan(name) },
+            onLost = { name ->
+                android.util.Log.d("Continuum", "mDNS lost $name")
+                node.withdrawLan(name)
+            },
         )
         repository.onAdvertise = ::advertise
+        registerReceiver(bluetoothState, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
         runCatching { node.start(repository.listener) }
             .onSuccess { port ->
                 repository.setRunning(true)
@@ -56,18 +82,23 @@ class ContinuumService : Service() {
     }
 
     private fun advertise(ad: AdvertisementFfi) {
-        val node = repository.continuum
+        lastAdvertisement = ad
         nsd.register(ad.serviceName, ad.serviceType, ad.port.toInt(), ad.txt)
         if (serviceType != ad.serviceType) {
             serviceType = ad.serviceType
             nsd.startDiscovery(ad.serviceType)
         }
         if (ble.available) {
-            ble.advertise(ad.bleServiceUuid, ad.beacon)
-            ble.startScan(ad.bleServiceUuid) { data, rssi -> node.observeBle(data, rssi.toShort()) }
+            startBle(ad)
         } else {
             repository.log("Bluetooth is off; using Wi-Fi only")
         }
+    }
+
+    private fun startBle(ad: AdvertisementFfi) {
+        val node = repository.continuum
+        ble.advertise(ad.bleServiceUuid, ad.beacon)
+        ble.startScan(ad.bleServiceUuid) { data, rssi -> node.observeBle(data, rssi.toShort()) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -80,6 +111,7 @@ class ContinuumService : Service() {
 
     override fun onDestroy() {
         repository.onAdvertise = null
+        unregisterReceiver(bluetoothState)
         ble.stopScan()
         ble.stopAdvertising()
         nsd.stopDiscovery()

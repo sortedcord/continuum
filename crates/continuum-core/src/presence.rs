@@ -98,7 +98,10 @@ pub struct RegistryConfig {
     /// BLE presence is dropped after this long without a beacon.
     pub ble_ttl: Duration,
     /// LAN presence is dropped after this long without a record refresh.
-    pub lan_ttl: Duration,
+    /// `None` (the default) relies on the mDNS stack to report removals:
+    /// Avahi and NsdManager report a service once and then send a removal,
+    /// with no periodic refresh, and they handle cache expiry themselves.
+    pub lan_ttl: Option<Duration>,
     /// Pairing candidates are dropped after this long unseen.
     pub candidate_ttl: Duration,
     /// Weight of each new RSSI sample in the moving average, in `(0, 1]`.
@@ -111,7 +114,7 @@ impl Default for RegistryConfig {
     fn default() -> Self {
         Self {
             ble_ttl: Duration::from_secs(30),
-            lan_ttl: Duration::from_secs(150),
+            lan_ttl: None,
             candidate_ttl: Duration::from_secs(30),
             rssi_smoothing: 0.3,
             immediate: Threshold {
@@ -424,7 +427,8 @@ impl PresenceRegistry {
             if presence
                 .lan
                 .as_ref()
-                .is_some_and(|lan| stale(lan.last_seen, config.lan_ttl))
+                .zip(config.lan_ttl)
+                .is_some_and(|(lan, ttl)| stale(lan.last_seen, ttl))
             {
                 presence.lan = None;
                 events.push(PresenceEvent::Lost {
@@ -654,6 +658,32 @@ mod tests {
             }]
         );
         assert!(fx.registry.presence(&peer).is_none());
+    }
+
+    #[test]
+    fn lan_presence_waits_for_withdrawal_by_default() {
+        let mut fx = Fixture::new();
+        let peer = fx.phone.device_id();
+        let id = fx.phone_id();
+        fx.registry.ingest(&Observation::lan(id, addr(4000), at(0)));
+        assert!(fx.registry.expire(at(3600)).is_empty());
+        assert!(fx.registry.presence(&peer).unwrap().is_reachable());
+    }
+
+    #[test]
+    fn lan_ttl_can_be_enabled() {
+        let mut fx = Fixture::new();
+        fx.registry.config.lan_ttl = Some(Duration::from_secs(60));
+        let peer = fx.phone.device_id();
+        let id = fx.phone_id();
+        fx.registry.ingest(&Observation::lan(id, addr(4000), at(0)));
+        assert_eq!(
+            fx.registry.expire(at(60)),
+            vec![PresenceEvent::Lost {
+                peer,
+                transport: Transport::Lan
+            }]
+        );
     }
 
     #[test]
